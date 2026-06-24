@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '1.6';
+  const SCRIPT_VERSION = '1.7';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -1028,34 +1028,46 @@
   // markup differs, paste it and these three helpers get hardened.)
   // ═════════════════════════════════════════════════════════════
 
-  // Device — a cmdk command palette. Type the device; if there's an EXACT match
-  // in the list pick it, otherwise use the built-in "save as manual entry" path.
-  // (No fuzzy matching — that's what caused wrong/fussy picks. Manual entry just
-  // keeps the typed name, which is what you want when it isn't in the catalogue.)
+  // Device — a cmdk command palette. Open it via its wrapper trigger (the
+  // aria-haspopup="dialog" element — clicking the input alone may not open it),
+  // type the device, and if there's an EXACT match pick it, otherwise use the
+  // built-in "save as manual entry" path. (No fuzzy matching — that caused fussy
+  // picks. Manual entry keeps the typed name when it isn't in the catalogue.)
   async function setDeviceField(text) {
-    const trigger = document.querySelector('input[placeholder*="device name" i]') ||
-                    document.querySelector('input[placeholder*="Search or type device" i]');
-    if (!trigger) throw new Error('Device field not found');
-    trigger.focus(); trigger.click();
+    const inp = document.querySelector('input[placeholder*="device name" i]') ||
+                document.querySelector('input[placeholder*="Search or type device" i]');
+    if (!inp) throw new Error('Device field not found');
 
-    const cmdkInput = await waitFor(() =>
-      document.querySelector('input[cmdk-input]') ||
-      document.querySelector('[cmdk-root] input'), 2000) || trigger;
+    // Open the popover via its real trigger, then fall back to the input itself.
+    const trigger = inp.closest('[aria-haspopup="dialog"]') || inp;
+    trigger.click();
+    let cmdkInput = await waitFor(() => document.querySelector('input[cmdk-input]'), 1300);
+    if (!cmdkInput) { inp.focus(); inp.click(); cmdkInput = await waitFor(() => document.querySelector('input[cmdk-input]'), 1300); }
+    cmdkInput = cmdkInput || inp;
+
+    cmdkInput.focus();
     setNativeValue(cmdkInput, text);
-    await sleep(450);
+    await sleep(500);
 
     const want = text.replace(/\s+/g,' ').trim().toLowerCase();
     const items = Array.from(document.querySelectorAll('[cmdk-item]')).filter(el => el.offsetParent !== null);
     const exact = items.find(el => el.textContent.replace(/\s+/g,' ').trim().toLowerCase() === want);
-    if (exact) { exact.click(); await sleep(160); return; }
+    if (exact) { exact.click(); await sleep(180); return; }
 
-    // No exact match → add manually. Prefer the blue "save as manual entry" banner,
-    // then the cmdk-empty "Add … as manual entry" button, then Enter as a fallback.
-    const banner = Array.from(document.querySelectorAll('[cmdk-list] div, [role="dialog"] div, [role="dialog"] button'))
-      .find(el => /save as manual entry|as manual entry/i.test(el.textContent) && el.offsetParent !== null);
-    if (banner) { banner.click(); await sleep(160); return; }
-    cmdkInput.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true }));
-    await sleep(160);
+    // No exact match → add manually. Blue "save as manual entry" banner / the
+    // cmdk-empty "Add … as manual entry" button / Enter, in that order.
+    const banner = Array.from(document.querySelectorAll('[cmdk-list] div, [cmdk-list] button, [role="dialog"] div, [role="dialog"] button'))
+      .find(el => /save as manual entry|add .*as manual entry|as manual entry/i.test(el.textContent) && el.offsetParent !== null);
+    if (banner) { banner.click(); await sleep(180); }
+    else { cmdkInput.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true })); await sleep(180); }
+
+    // If the palette is still open, the device didn't commit — try Enter once more,
+    // then surface it clearly instead of failing later on a disabled Create button.
+    if (document.querySelector('input[cmdk-input]')) {
+      document.querySelector('input[cmdk-input]').dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true }));
+      await sleep(180);
+      if (document.querySelector('input[cmdk-input]')) throw new Error(`Device "${text}" did not commit — the device palette stayed open. Paste me the device popup DOM if this persists.`);
+    }
   }
 
   // Issues — combobox opening a popover of role="checkbox" rows. Each row's
@@ -1150,7 +1162,9 @@
              || opts.find(o => want.includes(norm(o)));
     if (!opt) {
       document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
-      setStatus(`⚠️ Status "${statusText}" not in list. Real options: ${opts.map(o=>o.textContent.trim()).join(', ')}`);
+      const names = opts.map(o=>o.textContent.trim()).join(', ');
+      console.warn('[Ticket Loader] Status "'+statusText+'" not found. Real SOS options are: ['+names+']');
+      setStatus(`⚠️ Status "${statusText}" not in list. Real options: ${names}`);
       return false;
     }
     opt.click(); await sleep(180); return true;
