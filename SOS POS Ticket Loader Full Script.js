@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '1.8';
+  const SCRIPT_VERSION = '1.9';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -290,6 +290,8 @@
     doaDefault: 'no',          // 'no' | 'yes'
     addNotes: true,            // drop the row note into the Notes dialog after create
     useNoteParser: true,
+    salePay: 'auto',           // 'stage' | 'checkout' | 'auto'
+    saleMethod: 'eftpos',      // full-amount method when no cash/eftpos split: 'eftpos'|'cash'|'transfer'
     writeback: 'off',          // 'off' | 'manual' | 'auto'
     webAppUrl: '',             // Apps Script web-app /exec URL
     sheetSecret: '',           // optional shared secret matching the Apps Script
@@ -523,6 +525,26 @@
       </div>
 
       <hr class="sostk-divider">
+      <div class="sostk-row2">
+        <div class="sostk-field">
+          <label class="sostk-label">Sale payment</label>
+          <select class="sostk-select" id="sostk-sale-pay">
+            <option value="stage">Stage line only — I take payment</option>
+            <option value="checkout">Open Checkout — I hit Complete</option>
+            <option value="auto">Auto — pay &amp; Complete Payment</option>
+          </select>
+        </div>
+        <div class="sostk-field">
+          <label class="sostk-label">Default sale method</label>
+          <select class="sostk-select" id="sostk-sale-method">
+            <option value="eftpos">EFTPOS</option>
+            <option value="cash">Cash</option>
+            <option value="transfer">Transfer</option>
+          </select>
+        </div>
+      </div>
+
+      <hr class="sostk-divider">
       <div class="sostk-field">
         <label class="sostk-label">Sheet write-back</label>
         <select class="sostk-select" id="sostk-writeback">
@@ -589,6 +611,8 @@
   const $statusmap= document.getElementById('sostk-statusmap');
   const $issuemap = document.getElementById('sostk-issuemap');
   const $writeback= document.getElementById('sostk-writeback');
+  const $salePay  = document.getElementById('sostk-sale-pay');
+  const $saleMethod = document.getElementById('sostk-sale-method');
   const $webapp   = document.getElementById('sostk-webapp');
   const $secret   = document.getElementById('sostk-secret');
 
@@ -601,6 +625,8 @@
     $statusmap.value= JSON.stringify(cfg.statusMap, null, 2);
     $issuemap.value = JSON.stringify(cfg.issueMap, null, 2);
     $writeback.value= cfg.writeback || 'off';
+    $salePay.value  = cfg.salePay || 'auto';
+    $saleMethod.value = cfg.saleMethod || 'eftpos';
     $webapp.value   = cfg.webAppUrl || '';
     $secret.value   = cfg.sheetSecret || '';
   }
@@ -612,6 +638,8 @@
     cfg.useNoteParser = $noteP.value === 'yes';
     cfg.stepDelay     = Math.max(100, parseInt($delay.value,10) || DEFAULTS.stepDelay);
     cfg.writeback     = $writeback.value;
+    cfg.salePay       = $salePay.value;
+    cfg.saleMethod    = $saleMethod.value;
     cfg.webAppUrl     = $webapp.value.trim();
     cfg.sheetSecret   = $secret.value.trim();
     try { cfg.cols      = Object.assign({}, COL_DEFAULTS, JSON.parse($cols.value)); }
@@ -722,6 +750,7 @@
       const qNum = num(qRaw);
       const qIsWord = /quote/i.test(qRaw) && qNum === 0;
       const payNum = num(cols[c.CASH]) + num(cols[c.EFTPOS]);
+      const cashAmt = num(cols[c.CASH]), eftAmt = num(cols[c.EFTPOS]);
 
       const r = cfg.useNoteParser ? Parser.parseNote(desc)
                                   : { name:'', phone:'X', email:'', item:desc, device:'', jobs:[] };
@@ -754,7 +783,7 @@
         device: r.device || '',
         jobs:   (r.jobs && r.jobs.length) ? r.jobs : [],
         item:   r.item || desc,
-        quote, needsQuote,
+        quote, needsQuote, cashAmt, eftAmt,
         note:   desc,             // full original line goes into the Notes dialog
         status: 'pending',
       });
@@ -919,8 +948,7 @@
 
   // ── Create a new repair ticket ────────────────────────────────
   async function buildTicket(job) {
-    const tab = findTab('Ticket');
-    if (tab) { tab.click(); await sleep(cfg.stepDelay); }
+    await clickTab('Ticket');
 
     await createCustomer(job.customer);
 
@@ -976,18 +1004,96 @@
 
   // ── Build a quick product sale (walk-in) — reuses Sale tab ────
   async function buildSale(job) {
-    const tab = findTab('Sale');
-    if (tab) { tab.click(); await sleep(cfg.stepDelay); }
+    await clickTab('Sale');
     const w = findWalkInButton();
     if (!w) throw new Error('Walk-in button not found on Sale tab');
     w.click(); await sleep(cfg.stepDelay + 150);
 
     const descs  = lineInputs('Item description'), prices = lineInputs('0.00');
-    if (descs[0]) { setNativeValue(descs[0], job.item || '(item)'); await sleep(90); }
+    if (descs[0])  { setNativeValue(descs[0], job.item || '(item)'); await sleep(90); }
     if (prices[0]) { setNativeValue(prices[0], String(job.quote || 0)); await sleep(cfg.stepDelay); }
-    // Left at the built sale for you to take payment — sales payment flow
-    // lives in the Sales Loader; this just stages the line.
-    setStatus(`🏷️ Sale staged for ${labelOf(job)} — take payment in SOS POS.`);
+
+    if (cfg.salePay === 'stage') {
+      setStatus(`🏷️ Sale staged for ${labelOf(job)} — take payment in SOS POS.`);
+      return;
+    }
+
+    const checkoutBtn = findSaleCheckoutButton();
+    if (!checkoutBtn) throw new Error('Checkout button not found');
+    if (checkoutBtn.disabled) throw new Error('Checkout button is disabled (no item/price?)');
+    checkoutBtn.click();
+
+    const dialog = await waitFor(() => findSaleCheckoutDialog(), 5000);
+    if (!dialog) throw new Error('Checkout dialog did not open');
+    await sleep(cfg.stepDelay);
+
+    if (cfg.salePay === 'checkout') {
+      setStatus(`🧾 Checkout open for ${labelOf(job)} — complete payment manually.`);
+      return;
+    }
+    await payForSale(job, dialog);
+  }
+
+  // ── Sale payment (Checkout dialog) ────────────────────────────
+  function round2(x) { return Math.round(x*100)/100; }
+
+  async function payForSale(job, dialog) {
+    const total = round2(job.quote || 0);
+    if (total <= 0) { // nothing to pay — try to complete as-is
+      const c0 = findCompletePaymentBtn(dialog);
+      if (c0 && !c0.disabled) { c0.click(); await waitFor(() => !findSaleCheckoutDialog(), 6000); }
+      return;
+    }
+
+    // Work out the split: prefer the sheet's cash/eftpos columns, else full amount
+    // on the default method. Reconcile any rounding onto the default method.
+    let cash = round2(job.cashAmt || 0), eft = round2(job.eftAmt || 0), transfer = 0;
+    const sum = round2(cash + eft);
+    const m = cfg.saleMethod || 'eftpos';
+    if (sum <= 0) {
+      if (m === 'cash') cash = total; else if (m === 'transfer') transfer = total; else eft = total;
+    } else if (Math.abs(sum - total) > 0.005) {
+      const diff = round2(total - sum);
+      if (m === 'cash') cash = round2(cash + diff); else if (m === 'transfer') transfer = round2(transfer + diff); else eft = round2(eft + diff);
+    }
+
+    const cashIn = splitInput(dialog, 'Cash');
+    const eftIn  = splitInput(dialog, 'EFTPOS');
+    const trIn   = splitInput(dialog, 'Transfer');
+    // clear any pre-filled amounts first so the total matches exactly
+    [cashIn, eftIn, trIn].forEach(i => { if (i) setNativeValue(i, ''); });
+    await sleep(100);
+    if (cash > 0     && cashIn) { setNativeValue(cashIn, cash.toFixed(2)); await sleep(120); }
+    if (eft > 0      && eftIn)  { setNativeValue(eftIn,  eft.toFixed(2));  await sleep(120); }
+    if (transfer > 0 && trIn)   { setNativeValue(trIn,   transfer.toFixed(2)); await sleep(120); }
+    await sleep(cfg.stepDelay);
+
+    const complete = findCompletePaymentBtn(dialog);
+    if (!complete) throw new Error('Complete Payment button not found');
+    let t = 0; while (complete.disabled && t < 14) { await sleep(140); t++; }
+    if (complete.disabled) throw new Error('Complete Payment stayed disabled — amounts may not total. Left open.');
+    complete.click();
+    await waitFor(() => !findSaleCheckoutDialog(), 6000);
+    await sleep(cfg.stepDelay + 300);
+  }
+
+  function findSaleCheckoutButton() {
+    return Array.from(document.querySelectorAll('button')).find(b =>
+      !b.closest('[role="dialog"]') && /checkout/i.test(b.textContent.trim()) && !/move to board/i.test(b.textContent));
+  }
+  function findSaleCheckoutDialog() {
+    return Array.from(document.querySelectorAll('[role="dialog"]')).find(d => {
+      const h = d.querySelector('h2'); return h && /checkout/i.test(h.textContent);
+    });
+  }
+  // The split inputs sit in <div><label>Cash|EFTPOS|Transfer</label><input type=number></div>.
+  function splitInput(dialog, labelText) {
+    const lab = Array.from(dialog.querySelectorAll('label')).find(l => l.textContent.trim() === labelText);
+    if (!lab) return null;
+    return (lab.parentElement || dialog).querySelector('input[type="number"]');
+  }
+  function findCompletePaymentBtn(dialog) {
+    return Array.from(dialog.querySelectorAll('button')).find(b => /complete payment/i.test(b.textContent));
   }
 
   // ═════════════════════════════════════════════════════════════
@@ -1419,7 +1525,26 @@
   // ═════════════════════════════════════════════════════════════
   // DOM helpers  (shared with the Sales Loader where identical)
   // ═════════════════════════════════════════════════════════════
-  function findTab(label) { return Array.from(document.querySelectorAll('[role="tab"]')).find(t=>t.textContent.trim().toLowerCase().includes(label.toLowerCase())); }
+  function findTab(label) {
+    const want = label.toLowerCase();
+    const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+    // Prefer the radix id pattern (…-trigger-ticket / …-trigger-sale), then text.
+    return tabs.find(t => (t.id || '').toLowerCase().endsWith('trigger-' + want))
+        || tabs.find(t => t.textContent.trim().toLowerCase().includes(want));
+  }
+  // Reliable radix Tab activation: pointer + mouse + click + focus, then verify.
+  async function clickTab(label) {
+    const tab = findTab(label);
+    if (!tab) throw new Error(`"${label}" tab not found`);
+    if (tab.getAttribute('data-state') === 'active' || tab.getAttribute('aria-selected') === 'true') return true;
+    try { tab.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); } catch {}
+    tab.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    tab.click();
+    try { tab.focus(); } catch {}
+    await waitFor(() => tab.getAttribute('data-state') === 'active' || tab.getAttribute('aria-selected') === 'true', 1500);
+    await sleep(cfg.stepDelay);
+    return true;
+  }
   function findWalkInButton() { return document.querySelector('button[title*="Walk-in" i]') || Array.from(document.querySelectorAll('button')).find(b=>/walk[\s-]?in/i.test(b.getAttribute('title')||b.textContent||'')); }
   function findAddCustomerButton() { return Array.from(document.querySelectorAll('button')).find(b=>b.querySelector('svg.lucide-user-plus')); }
   function lineInputs(ph) { return Array.from(document.querySelectorAll(`input[placeholder="${ph}"]`)); }
