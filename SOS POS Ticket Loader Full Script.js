@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.2';
+  const SCRIPT_VERSION = '2.3';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -987,6 +987,21 @@
         setStatus(`✓ Done "${labelOf(jobs[i])}". Click for next.`);
       } else finishAll();
     } catch (e) {
+      if (e && e.skip) {
+        // soft skip — advance like the Skip button, no retry/freeze
+        setJobStatus(i, 'skipped'); jobs[i].status = 'skipped';
+        logIssue(e.message, 'warn');
+        builtIdx = i; setProgress();
+        const n = nextBuildable(i + 1);
+        if (n < jobs.length) {
+          const total = jobs.filter(j => j.kind !== 'manual').length;
+          const num = jobs.filter((j,k) => k <= i && j.kind !== 'manual').length + 1;
+          buildBtn.disabled = false;
+          buildBtn.textContent = `▶ Next (${num}/${total})`;
+          setStatus('⏭ ' + e.message);
+        } else finishAll();
+        return;
+      }
       setJobStatus(i, 'pending'); jobs[i].status='pending';
       buildBtn.disabled = false;
       buildBtn.textContent = `▶ Retry ${labelOf(jobs[i])}`;
@@ -1062,6 +1077,7 @@
   // ── Create a new repair ticket ────────────────────────────────
   async function buildTicket(job) {
     await clickTab('Ticket');
+    await resetTicketForm();   // clean slate after any prior failed/skipped row
 
     await createCustomer(job.customer);
 
@@ -1097,20 +1113,36 @@
     }
   }
 
+  // Make an error that means "skip this row" (auto-advance, no retry/freeze).
+  function skipError(msg) { const e = new Error(msg); e.skip = true; return e; }
+
+  // Brief non-blocking toast (auto-dismisses).
+  function showSkipBox(msg) {
+    const t = document.createElement('div');
+    t.style.cssText = 'position:fixed;bottom:90px;left:50%;transform:translateX(-50%);z-index:100003;' +
+      'background:#1a1200;border:1px solid #78350f;color:#fdba74;padding:10px 16px;border-radius:10px;' +
+      'font-family:system-ui,sans-serif;font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.5);max-width:380px;text-align:center;';
+    t.textContent = '⏭ ' + msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 3500);
+  }
+
   // ── Update an existing ticket (status + note) ─────────────────
-  //  NEEDS your board/search DOM to open the ticket. The status-set
-  //  and add-note steps below are wired; openTicketByNumber is the
-  //  one helper that needs the snippet for searching/opening a ticket.
+  //  Needs the board/search DOM to open a ticket. Until that's wired, if it can't
+  //  find the ticket it auto-skips (toast + advance) instead of freezing.
   async function updateTicket(job) {
     const opened = await openTicketByNumber(job.ticket);
-    if (!opened) throw new Error(`Could not open ticket ${job.ticket} — need the board/search DOM to wire this. Skipped.`);
+    if (!opened) {
+      showSkipBox(`Couldn't find ticket ${job.ticket} — skipped. Update it manually.`);
+      throw skipError(`Ticket ${job.ticket} not found — auto-skipped.`);
+    }
     if (job.sosStatus) await setTicketStatus(job.sosStatus);
     if (cfg.addNotes && job.note) await addNote(job.ticket, job.note);
   }
 
   // ── Add a note to an existing ticket only ─────────────────────
   async function noteOnlyJob(job) {
-    if (!job.ticket) throw new Error('Note row has no ticket # — handle manually.');
+    if (!job.ticket) { showSkipBox('Note row has no ticket # — skipped.'); throw skipError('Note row has no ticket # — auto-skipped.'); }
     if (!job.note) return;
     await addNote(job.ticket, job.note);
   }
@@ -1276,46 +1308,69 @@
   // markup differs, paste it and these three helpers get hardened.)
   // ═════════════════════════════════════════════════════════════
 
-  // Device — a cmdk command palette. Open it via its wrapper trigger (the
-  // aria-haspopup="dialog" element — clicking the input alone may not open it),
-  // type the device, and if there's an EXACT match pick it, otherwise use the
-  // built-in "save as manual entry" path. (No fuzzy matching — that caused fussy
-  // picks. Manual entry keeps the typed name when it isn't in the catalogue.)
+  // Close any stray popovers/menus/dialogs from a prior row and clear the device
+  // field, so each ticket starts from a clean form (fixes cascading failures after
+  // a skipped/failed row).
+  async function resetTicketForm() {
+    for (let k = 0; k < 3; k++) { document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })); await sleep(70); }
+    const dev = document.querySelector('input[placeholder*="device name" i]') ||
+                document.querySelector('input[placeholder*="Search or type device" i]');
+    if (dev && dev.value) setNativeValue(dev, '');
+    await sleep(120);
+  }
+
+  // Device — a cmdk command palette. Clear it, type, click an EXACT catalogue match
+  // if there is one, else commit as a manual entry (Enter is the documented gesture;
+  // the blue banner / empty-state button are fallbacks). Never hard-fails the ticket
+  // over the device — logs a warning and lets the Create-disabled check decide.
   async function setDeviceField(text) {
     const inp = document.querySelector('input[placeholder*="device name" i]') ||
                 document.querySelector('input[placeholder*="Search or type device" i]');
     if (!inp) throw new Error('Device field not found');
 
-    // Open the popover via its real trigger, then fall back to the input itself.
+    if (inp.value) { setNativeValue(inp, ''); await sleep(80); }   // clear leftover text
+
     const trigger = inp.closest('[aria-haspopup="dialog"]') || inp;
     trigger.click();
-    let cmdkInput = await waitFor(() => document.querySelector('input[cmdk-input]'), 1300);
-    if (!cmdkInput) { inp.focus(); inp.click(); cmdkInput = await waitFor(() => document.querySelector('input[cmdk-input]'), 1300); }
-    cmdkInput = cmdkInput || inp;
+    let cmdk = await waitFor(() => document.querySelector('input[cmdk-input]'), 1300);
+    if (!cmdk) { inp.focus(); inp.click(); cmdk = await waitFor(() => document.querySelector('input[cmdk-input]'), 1300); }
+    cmdk = cmdk || inp;
 
-    cmdkInput.focus();
-    setNativeValue(cmdkInput, text);
-    await sleep(500);
+    cmdk.focus();
+    setNativeValue(cmdk, text);
+    await sleep(550);
 
     const want = text.replace(/\s+/g,' ').trim().toLowerCase();
-    const items = Array.from(document.querySelectorAll('[cmdk-item]')).filter(el => el.offsetParent !== null);
-    const exact = items.find(el => el.textContent.replace(/\s+/g,' ').trim().toLowerCase() === want);
-    if (exact) { exact.click(); await sleep(180); return; }
+    const exact = Array.from(document.querySelectorAll('[cmdk-item]'))
+      .filter(el => el.offsetParent !== null)
+      .find(el => el.textContent.replace(/\s+/g,' ').trim().toLowerCase() === want);
+    if (exact) { exact.click(); await sleep(180); }
+    else { await commitManualDevice(cmdk, text); }
 
-    // No exact match → add manually. Blue "save as manual entry" banner / the
-    // cmdk-empty "Add … as manual entry" button / Enter, in that order.
+    // Ensure the palette closed; one more attempt, then Escape + warn (don't throw —
+    // a stuck palette shouldn't abort the whole row; Create-disabled will catch a
+    // genuinely empty device).
+    if (document.querySelector('input[cmdk-input]')) {
+      await commitManualDevice(cmdk, text);
+      if (document.querySelector('input[cmdk-input]')) {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
+        await sleep(120);
+        logIssue(`Device "${text}" may not have committed (palette stayed open).`, 'warn');
+      }
+    }
+  }
+
+  // Commit the typed device as a manual entry: Enter first (works for both an active
+  // match and the "no match → save as manual" case), then the banner / empty button.
+  async function commitManualDevice(cmdk, text) {
+    cmdk.focus();
+    ['keydown','keypress','keyup'].forEach(t =>
+      cmdk.dispatchEvent(new KeyboardEvent(t, { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true })));
+    await sleep(220);
+    if (!document.querySelector('input[cmdk-input]')) return;
     const banner = Array.from(document.querySelectorAll('[cmdk-list] div, [cmdk-list] button, [role="dialog"] div, [role="dialog"] button'))
       .find(el => /save as manual entry|add .*as manual entry|as manual entry/i.test(el.textContent) && el.offsetParent !== null);
-    if (banner) { banner.click(); await sleep(180); }
-    else { cmdkInput.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true })); await sleep(180); }
-
-    // If the palette is still open, the device didn't commit — try Enter once more,
-    // then surface it clearly instead of failing later on a disabled Create button.
-    if (document.querySelector('input[cmdk-input]')) {
-      document.querySelector('input[cmdk-input]').dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true }));
-      await sleep(180);
-      if (document.querySelector('input[cmdk-input]')) throw new Error(`Device "${text}" did not commit — the device palette stayed open. Paste me the device popup DOM if this persists.`);
-    }
+    if (banner) { banner.click(); await sleep(220); }
   }
 
   // Issues — combobox opening a popover of role="checkbox" rows. Each row's
