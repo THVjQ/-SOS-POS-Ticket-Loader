@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '1.5';
+  const SCRIPT_VERSION = '1.6';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -105,10 +105,14 @@
     const JOBS = [
       [/charging?\s*port\s*clean|c\/?p\s*clean|port\s*clean/i,       'Charging Port Clean'],
       [/charging?\s*port|charge\s*port|c\/?p\b/i,                    'Charging Port'],
+      [/not\s*charging|won'?t\s*charge|wont\s*charge|no\s*charge|charging\s*(?:issue|problem|fault)/i, 'Charging Issues'],
       [/rear\s*housing/i,                                             'Rear Housing'],
       [/rear\s*glass|back\s*glass|b\/?g\b/i,                         'Rear Glass'],
       [/camera\s*glass|cam\s*glass|cam(?:era)?\s*lens|lens\s*protector/i, 'Camera Glass'],
+      [/front\s*cam(?:era)?|selfie\s*cam(?:era)?/i,                  'Front Camera'],
       [/\bcamera\b|\bcam\b/i,                                         'Camera'],
+      [/face\s*id|faceid/i,                                           'Face ID'],
+      [/no\s*power|won'?t\s*(?:turn\s*on|power)|wont\s*(?:turn\s*on|power)|not\s*turning\s*on|no\s*boot/i, 'No Power'],
       [/housing|frame/i,                                              'Housing'],
       [/\boled\b/i,                                                   'OLED'],
       [/\blcd\b/i,                                                    'LCD'],
@@ -124,6 +128,7 @@
       [/sim\s*tray/i,                                                 'Sim Tray'],
       [/signal\s*flex/i,                                              'Signal Flex'],
       [/microphone|\bmic\b/i,                                         'Microphone'],
+      [/diagnos\w*|\bdiag\b/i,                                        'Diagnose'],
       [/\bwd\b|water\s*damaged?|liquid\s*damaged?/i,                  'Water Damage'],
     ];
 
@@ -235,13 +240,13 @@
 
   // ═════════════════════════════════════════════════════════════
   // ISSUE MAP  (parser job label → SOS POS "Issues" checklist name)
-  //  The SOS list: Screen · Battery · Data Transfer · Back Glass ·
-  //  Charging Issues · Charging Port · Data Recovery · Diagnose · Face ID ·
-  //  Frame · Front Camera · Housing / Cosmetic · No Power · Other ·
-  //  Rear Camera · Software / Update · Speaker · Virus Removal · Water Damage ·
-  //  Other - see notes.  Matching is exact first, then "contains", then
-  //  "Other - see notes" as a last resort so the required field is never empty.
-  //  Editable in Settings.
+  //  Confirmed SOS list (20 options):
+  //    Screen · Battery · Data Transfer · Back Glass · Charging Issues ·
+  //    Charging Port · Data Recovery · Diagnose · Face ID · Frame ·
+  //    Front Camera · Housing / Cosmetic · No Power · Other · Rear Camera ·
+  //    Software / Update · Speaker · Virus Removal · Water Damage · Other - see notes.
+  //  Matching is exact → contains → "Other - see notes" so the required field is
+  //  never empty. Editable in Settings; values must match the SOS option text.
   // ═════════════════════════════════════════════════════════════
   const ISSUE_MAP_DEFAULT = {
     'Screen':              'Screen',
@@ -251,15 +256,24 @@
     'Battery':             'Battery',
     'Charging Port':       'Charging Port',
     'Charging Port Clean': 'Charging Port',
+    'Charging Issues':     'Charging Issues',
+    'Back Glass':          'Back Glass',
     'Rear Glass':          'Back Glass',
     'Rear Housing':        'Housing / Cosmetic',
     'Housing':             'Housing / Cosmetic',
+    'Frame':               'Frame',
     'Camera':              'Rear Camera',
+    'Rear Camera':         'Rear Camera',
     'Camera Glass':        'Rear Camera',
+    'Front Camera':        'Front Camera',
+    'Face ID':             'Face ID',
+    'No Power':            'No Power',
+    'Diagnose':            'Diagnose',
     'Data Transfer':       'Data Transfer',
     'Data Recovery':       'Data Recovery',
     'Virus Clean':         'Virus Removal',
     'Restore':             'Software / Update',
+    'Software / Update':   'Software / Update',
     'Speaker':             'Speaker',
     'Water Damage':        'Water Damage',
     'Power Button':        'Other',
