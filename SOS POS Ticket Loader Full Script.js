@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '1.4';
+  const SCRIPT_VERSION = '1.5';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -953,9 +953,11 @@
   async function createCustomer(c) {
     const addBtn = findAddCustomerButton();
     if (!addBtn) throw new Error('Add-customer (+) button not found');
+    await sleep(120);
     addBtn.click();
 
-    const dialog = await waitFor(() => document.querySelector('[role="dialog"]'), 4000);
+    let dialog = await waitFor(() => document.querySelector('[role="dialog"]'), 4000);
+    if (!dialog) { addBtn.click(); dialog = await waitFor(() => document.querySelector('[role="dialog"]'), 4000); }
     if (!dialog) throw new Error('Add Customer dialog did not open');
     await sleep(cfg.stepDelay);
 
@@ -1012,18 +1014,33 @@
   // markup differs, paste it and these three helpers get hardened.)
   // ═════════════════════════════════════════════════════════════
 
-  // Device — input that allows "Search or type device name".
+  // Device — a cmdk command palette. Type the device; if there's an EXACT match
+  // in the list pick it, otherwise use the built-in "save as manual entry" path.
+  // (No fuzzy matching — that's what caused wrong/fussy picks. Manual entry just
+  // keeps the typed name, which is what you want when it isn't in the catalogue.)
   async function setDeviceField(text) {
-    const inp = document.querySelector('input[placeholder*="device name" i]') ||
-                document.querySelector('input[placeholder*="Search or type device" i]');
-    if (!inp) throw new Error('Device field not found');
-    inp.focus();
-    setNativeValue(inp, text);
+    const trigger = document.querySelector('input[placeholder*="device name" i]') ||
+                    document.querySelector('input[placeholder*="Search or type device" i]');
+    if (!trigger) throw new Error('Device field not found');
+    trigger.focus(); trigger.click();
+
+    const cmdkInput = await waitFor(() =>
+      document.querySelector('input[cmdk-input]') ||
+      document.querySelector('[cmdk-root] input'), 2000) || trigger;
+    setNativeValue(cmdkInput, text);
     await sleep(450);
-    const opt = pickOptionByText(text.split(/\s+/)[0]); // match on first token e.g. "iPhone"
-    if (opt) { opt.click(); await sleep(160); return; }
-    // "or type" — accept the typed value with Enter
-    inp.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', bubbles:true }));
+
+    const want = text.replace(/\s+/g,' ').trim().toLowerCase();
+    const items = Array.from(document.querySelectorAll('[cmdk-item]')).filter(el => el.offsetParent !== null);
+    const exact = items.find(el => el.textContent.replace(/\s+/g,' ').trim().toLowerCase() === want);
+    if (exact) { exact.click(); await sleep(160); return; }
+
+    // No exact match → add manually. Prefer the blue "save as manual entry" banner,
+    // then the cmdk-empty "Add … as manual entry" button, then Enter as a fallback.
+    const banner = Array.from(document.querySelectorAll('[cmdk-list] div, [role="dialog"] div, [role="dialog"] button'))
+      .find(el => /save as manual entry|as manual entry/i.test(el.textContent) && el.offsetParent !== null);
+    if (banner) { banner.click(); await sleep(160); return; }
+    cmdkInput.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true }));
     await sleep(160);
   }
 
@@ -1099,18 +1116,44 @@
     if (target.checkbox.getAttribute('aria-checked') !== 'true') { target.checkbox.click(); await sleep(140); }
   }
 
-  // Status — radix Select. Click trigger, click the matching option.
+  // Status — radix Select. Open it, read the REAL options, pick the match. On a
+  // miss it leaves the default and reports the available option names so the
+  // status map can be corrected in Settings (no more silent default "Repairing").
   async function setTicketStatus(statusText) {
-    const trig = Array.from(document.querySelectorAll('button[role="combobox"]'))
-      .find(b => { const sp = b.querySelector('span'); return sp && /repairing|status|complete|waiting|ready|new/i.test(sp.textContent) && !/issue/i.test(b.textContent); });
+    if (!statusText) return false;
+    const trig = findStatusTrigger();
     if (!trig) { setStatus('⚠️ Status dropdown not found — left at default.'); return false; }
     trig.click();
-    const list = await waitFor(() => document.querySelector('[role="listbox"]'), 2500);
-    if (!list) { setStatus('⚠️ Status list did not open — left at default.'); return false; }
-    const opt = Array.from(list.querySelectorAll('[role="option"]'))
-      .find(o => o.textContent.trim().toLowerCase().includes(statusText.toLowerCase()));
-    if (!opt) { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); setStatus(`⚠️ Status "${statusText}" not in list — left at default.`); return false; }
-    opt.click(); await sleep(160); return true;
+    const opts = await waitFor(() => {
+      const o = Array.from(document.querySelectorAll('[role="option"]')).filter(e => e.offsetParent !== null);
+      return o.length ? o : null;
+    }, 2500);
+    if (!opts) { setStatus('⚠️ Status options did not open — left at default.'); return false; }
+    const want = statusText.replace(/\s+/g,' ').trim().toLowerCase();
+    const norm = o => o.textContent.replace(/\s+/g,' ').trim().toLowerCase();
+    const opt = opts.find(o => norm(o) === want)
+             || opts.find(o => norm(o).includes(want))
+             || opts.find(o => want.includes(norm(o)));
+    if (!opt) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
+      setStatus(`⚠️ Status "${statusText}" not in list. Real options: ${opts.map(o=>o.textContent.trim()).join(', ')}`);
+      return false;
+    }
+    opt.click(); await sleep(180); return true;
+  }
+
+  // The Status select trigger sits under a <label>Status</label>; scope to that
+  // first, then fall back to a role=combobox whose value reads like a status.
+  function findStatusTrigger() {
+    const lab = Array.from(document.querySelectorAll('label')).find(l => l.textContent.trim() === 'Status');
+    if (lab && lab.parentElement) {
+      const btn = lab.parentElement.querySelector('button[role="combobox"]');
+      if (btn) return btn;
+    }
+    return Array.from(document.querySelectorAll('button[role="combobox"]'))
+      .find(b => { const sp = b.querySelector('span'); return sp &&
+        /repairing|waiting|ready|complete|progress|pending|collected|parts|customer|booked|diagnos/i.test(sp.textContent) &&
+        !/issue|select issues/i.test(b.textContent); });
   }
 
   // Find a visible popup option whose text contains `text`.
