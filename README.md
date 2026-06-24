@@ -155,6 +155,7 @@ match what's in the sheet.
 | Shared secret | Optional, must match the Apps Script `SECRET` |
 | Column map (JSON) | 0-based column indices |
 | Status map (JSON) | Col D code → route + SOS status |
+| Issue map (JSON) | Parser label → SOS issue checklist name |
 
 Settings persist via Tampermonkey storage. **Reset maps** restores the default column
 and status maps (then Save to keep).
@@ -166,12 +167,14 @@ and status maps (then Save to keep).
 These interactions were written to the standard radix/shadcn pattern but the source
 DOM for the popups wasn't fully captured, so they may need a tweak against the live app:
 
-- **Issues picker** — required field. If a selection doesn't stick, *Create Ticket* stays
-  disabled and the script says so.
 - **Device search** and **Status dropdown** — best-effort option matching.
 - **Update existing ticket** (`openTicketByNumber`) — a stub. Opening an existing ticket
   needs the board search / row-open DOM wired in; until then the Update path can't open
   the ticket on its own.
+
+The **Issues picker** is wired to the real checkbox popover (v1.4). Parser labels are
+mapped to SOS issue names via the editable **Issue map** in Settings; if nothing matches,
+the row falls back to *Other - see notes* so the required field is never empty.
 
 If any of these misbehave, grab the relevant popup's HTML and the matching helper can be
 hardened.
@@ -184,6 +187,42 @@ hardened.
 
 ## Changelog
 
+- **2.6** — **walk-ins (no customer name, no existing ticket #) always go through the
+  Sale tab**, never a repair ticket. Tickets/updates whose status is **Collected / Paid
+  & Collected / Paid / Part Paid** now **take the payment** (cash col E + EFTPOS col F,
+  else the quote) via the row's Checkout, then re-assert the status.
+- **2.5** — **updates now work on board-visible tickets**: finds the ticket's row by
+  number and sets status via the row's dropdown + adds the note via the row's Notes
+  button (tickets not on the board still auto-skip). "Waiting on Parts/Customer/CX" →
+  **Repairing**; "Enquiry" → **skip with a toast** (one-time map migration applies these
+  over a saved map).
+- **2.4** — form reset now **removes the selected customer first** (a leftover customer
+  disabled the + button and locked the form); rows with **no parsed device** get a
+  popup that shows the note and takes a typed device before continuing (or skip).
+- **2.3** — form reset (close stray popovers + clear the device field) before each
+  ticket, so a failed/skipped row no longer breaks the next one; more reliable device
+  commit (Enter-first manual entry, never hard-fails the row); update/note rows that
+  can't find their ticket now **auto-skip with a toast** instead of freezing.
+- **2.2** — removed the blocking quote pop-up that could stall ticket creation; a
+  "quote" cell now uses the inline preview field and is skipped (with a warning) if
+  blank. Added a **⏭ Skip** button next to Start/Clear to skip the current row.
+- **2.1** — error/warning log: every failure (and silent warnings like an unmapped
+  status or a skipped note) is collected into a **⚠ popup** (header badge, auto-opens
+  at finish), with Copy/Clear.
+- **2.0** — status fixed: the picker is a dropdown *menu* (opens on pointerdown, uses
+  `menuitem`s) — now opened and matched correctly; full status map built from your
+  sheet → the real SOS list (Paid, Collected, Paid & Collected, Pick Up Ready, Micro
+  Sent/To Send/Back, Part Ordered/Arrived/Not Ordered, etc.).
+- **1.9** — sale auto-payment via the Checkout dialog (Stage / Open checkout / Auto-pay),
+  with cash/EFTPOS split from the sheet and a default-method fallback; reliable
+  Ticket↔Sale tab switching (matches the radix tab by id); **🔍 Probe status** button.
+- **1.6** — issue map completed against the full confirmed SOS list (20 options); parser
+  now detects Face ID, No Power, Charging Issues, Front Camera and Diagnose.
+- **1.5** — device field uses the cmdk "save as manual entry" path instead of fuzzy
+  matching; status selector reads the live options and reports them on a miss;
+  add-customer retries once if the dialog doesn't open.
+- **1.4** — Issues picker wired to the real checkbox popover, with an editable
+  parser-label → SOS-issue **Issue map** and an *Other - see notes* fallback.
 - **1.3** — bundled the Apps Script into the userscript as a paste-once comment block.
 - **1.2** — Google Sheets write-back (Copy / Push / Auto) via Apps Script web app.
 - **1.1** — existing ticket from col C only; refunds & notes skipped as *Not completed*;
