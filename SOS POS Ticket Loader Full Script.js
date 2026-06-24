@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.2
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.0';
+  const SCRIPT_VERSION = '2.2';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -376,6 +376,12 @@
       font-size: 10px; font-weight: 700; color: #e0e7ff; background: rgba(0,0,0,.22);
       border-radius: 20px; padding: 2px 8px; letter-spacing: .3px; white-space: nowrap;
     }
+    #sostk-err-badge {
+      background: rgba(127,29,29,.55); border: none; color: #fecaca; font-size: 11px;
+      font-weight: 700; border-radius: 20px; padding: 2px 9px; cursor: pointer;
+      display: none; align-items: center; gap: 3px; white-space: nowrap;
+    }
+    #sostk-err-badge:hover { background: rgba(127,29,29,.85); }
     #sostk-close-btn {
       background: rgba(255,255,255,.2); border: none; color: #fff; width: 26px; height: 26px;
       border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; display: flex;
@@ -430,6 +436,8 @@
     .sostk-job { background: #131f2e; border: 1px solid #1e293b; border-radius: 10px; padding: 9px 11px; }
     .sostk-job.active { background: #1e1b4b; border-color: #6366f1; }
     .sostk-job.done { background: #0a150a; border-color: #166534; opacity: .65; }
+    .sostk-job.skipped { opacity: .5; border-color: #475569; }
+    .sostk-job.skipped .sostk-job-name { text-decoration: line-through; }
     .sostk-job.update { background: #0c1a26; border-color: #0e7490; }
     .sostk-job.manual { background: #160d1f; border-color: #6d28d9; }
     .sostk-job-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
@@ -484,6 +492,7 @@
     <div id="sostk-header">
       <span>🔧</span><span class="sostk-title">Ticket Loader</span>
       <span id="sostk-ver">v…</span>
+      <button id="sostk-err-badge" title="Build issues — click to view" style="display:none">⚠ <span id="sostk-err-count">0</span></button>
       <button id="sostk-close-btn" title="Close">✕</button>
     </div>
     <div id="sostk-tabs">
@@ -507,6 +516,7 @@
       </div>
       <div class="sostk-btn-row">
         <button class="sostk-btn sostk-btn-success" id="sostk-build-btn" style="display:none;flex:1">▶ Start</button>
+        <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-skip-btn" style="display:none">⏭ Skip</button>
         <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-clear-btn" style="display:none">Clear</button>
       </div>
       <div id="sostk-preview"></div>
@@ -633,6 +643,7 @@
 
   fab.addEventListener('click', () => panel.classList.toggle('open'));
   document.getElementById('sostk-close-btn').addEventListener('click', () => panel.classList.remove('open'));
+  document.getElementById('sostk-err-badge').addEventListener('click', showErrorPopup);
   document.querySelectorAll('.sostk-tab').forEach(tab => {
     tab.addEventListener('click', () => switchTab(tab.dataset.tab));
   });
@@ -723,6 +734,7 @@
   // State
   // ═════════════════════════════════════════════════════════════
   let jobs = [], builtIdx = -1, rawCache = '', results = [];
+  let errors = [], currentLabel = '';   // error/warning log for the popup
   const captured = new Set();
 
   const dropZone = document.getElementById('sostk-drop-zone');
@@ -824,7 +836,7 @@
       });
     }
 
-    jobs = out; builtIdx = -1; captured.clear();
+    jobs = out; builtIdx = -1; captured.clear(); errors = []; updateErrorBadge();
     renderPreview();
 
     const buildable = jobs.filter(j => j.kind !== 'manual').length;
@@ -843,6 +855,7 @@
         b.textContent = `▶ Start — Build 1/${buildable} (${labelOf(first)})`;
       } else { b.style.display = 'none'; }
       document.getElementById('sostk-clear-btn').style.display = 'block';
+      document.getElementById('sostk-skip-btn').style.display = 'block';
       setStatus(buildable ? '' : 'ℹ️ Nothing auto-buildable — all rows need manual handling.');
     } else {
       dropZone.classList.remove('has-data');
@@ -886,7 +899,7 @@
           ? `<div class="sostk-line"><span class="ln-desc">${esc([j.device, j.jobs.join(' + ')].filter(Boolean).join(' · '))}</span>${j.quote?`<span class="ln-quote">$${j.quote.toFixed(2)}</span>`:''}</div>`
           : (j.item ? `<div class="sostk-line"><span class="ln-desc">${esc(j.item)}</span>${j.quote?`<span class="ln-quote">$${j.quote.toFixed(2)}</span>`:''}</div>` : '');
         const quoteEdit = (j.needsQuote && (kind==='ticket'||kind==='update'))
-          ? `<input class="sostk-q-edit" data-gi="${gi}" type="number" step="0.01" min="0" placeholder="Cell says “quote” — enter $ here, or leave blank to be asked" value="${j.quote||''}">`
+          ? `<input class="sostk-q-edit" data-gi="${gi}" type="number" step="0.01" min="0" placeholder="Cell says “quote” — enter $ here (or leave blank to skip)" value="${j.quote||''}">`
           : '';
         const noteRow = cfg.addNotes && j.note ? `<div class="sostk-note-row" title="${esc(j.note)}">📝 ${esc(j.note.slice(0,90))}${j.note.length>90?'…':''}</div>` : '';
         html.push(`
@@ -905,11 +918,12 @@
   function esc(s) { return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
   function clearAll() {
-    jobs=[]; builtIdx=-1; rawCache=''; captured.clear();
+    jobs=[]; builtIdx=-1; rawCache=''; captured.clear(); errors=[]; updateErrorBadge();
     pasteArea.value='';
     document.getElementById('sostk-preview').innerHTML='';
     document.getElementById('sostk-build-btn').style.display='none';
     document.getElementById('sostk-clear-btn').style.display='none';
+    document.getElementById('sostk-skip-btn').style.display='none';
     document.getElementById('sostk-prog-bar').style.width='0%';
     dropZone.classList.remove('has-data');
     document.getElementById('sostk-paste-summary').style.display='none';
@@ -917,7 +931,7 @@
   }
 
   function setStatus(m) { document.getElementById('sostk-status').textContent = m; }
-  function setJobStatus(i,s) { jobs[i].status=s; const el=document.getElementById(`sostk-job-${i}`); if(el) el.classList.toggle('active', s==='active'); if(el && s==='done') el.classList.add('done'); }
+  function setJobStatus(i,s) { jobs[i].status=s; const el=document.getElementById(`sostk-job-${i}`); if(el) el.classList.toggle('active', s==='active'); if(el && s==='done') el.classList.add('done'); if(el && s==='skipped') el.classList.add('skipped'); }
   function setProgress() {
     const buildable = jobs.filter(j=>j.kind!=='manual');
     const done = buildable.filter(j=>j.status==='done').length;
@@ -929,6 +943,24 @@
   // ═════════════════════════════════════════════════════════════
   const buildBtn = document.getElementById('sostk-build-btn');
   buildBtn.addEventListener('click', onBuildClick);
+  document.getElementById('sostk-skip-btn').addEventListener('click', onSkipClick);
+
+  // Skip the next job that Start/Next would build, mark it, advance.
+  function onSkipClick() {
+    let i = nextBuildable(builtIdx + 1);
+    if (i >= jobs.length) { finishAll(); return; }
+    setJobStatus(i, 'skipped');
+    logIssue(`Skipped "${labelOf(jobs[i])}" manually.`, 'warn');
+    builtIdx = i; setProgress();
+    const n = nextBuildable(i + 1);
+    if (n < jobs.length) {
+      const total = jobs.filter(j => j.kind !== 'manual').length;
+      const num = jobs.filter((j,k) => k <= i && j.kind !== 'manual').length + 1;
+      buildBtn.disabled = false;
+      buildBtn.textContent = `▶ Next (${num}/${total})`;
+      setStatus(`⏭ Skipped "${labelOf(jobs[i])}".`);
+    } else finishAll();
+  }
   document.getElementById('sostk-clear-btn').addEventListener('click', clearAll);
 
   function nextBuildable(from) {
@@ -958,7 +990,8 @@
       setJobStatus(i, 'pending'); jobs[i].status='pending';
       buildBtn.disabled = false;
       buildBtn.textContent = `▶ Retry ${labelOf(jobs[i])}`;
-      setStatus('✕ ' + e.message); console.error('[SOS Ticket Loader]', e);
+      logIssue(e.message, 'error');
+      setStatus('✕ ' + e.message + '  ·  ⚠ click the badge for all errors'); console.error('[SOS Ticket Loader]', e);
     }
   }
 
@@ -966,19 +999,64 @@
     const manual = jobs.filter(j=>j.kind==='manual').length;
     buildBtn.textContent = '✓ All done';
     buildBtn.disabled = true;
-    setStatus(`🎉 Finished — ${results.length} captured${manual?`, ${manual} manual row${manual>1?'s':''} left for you`:''}. See Results.`);
+    document.getElementById('sostk-skip-btn').style.display = 'none';
+    setStatus(`🎉 Finished — ${results.length} captured${manual?`, ${manual} manual row${manual>1?'s':''} left for you`:''}${errors.length?` · ⚠ ${errors.length} issue${errors.length>1?'s':''}`:''}.`);
     if (cfg.writeback === 'auto' && cfg.webAppUrl && results.length) pushToSheet(true);
-    switchTab('results');
+    if (errors.length) showErrorPopup(); else switchTab('results');
   }
 
   // ═════════════════════════════════════════════════════════════
   // Build dispatch
   // ═════════════════════════════════════════════════════════════
   async function buildJob(job) {
+    currentLabel = labelOf(job);
     if (job.kind === 'ticket')      await buildTicket(job);
     else if (job.kind === 'update') await updateTicket(job);
     else if (job.kind === 'sale')   await buildSale(job);
     else if (job.kind === 'note')   await noteOnlyJob(job);
+  }
+
+  // ── Error / warning log (feeds the errors popup) ──────────────
+  function logIssue(reason, type) {
+    errors.push({ label: currentLabel || '(row)', reason: String(reason), type: type || 'error', when: new Date() });
+    updateErrorBadge();
+  }
+  function updateErrorBadge() {
+    const b = document.getElementById('sostk-err-badge');
+    const c = document.getElementById('sostk-err-count');
+    if (!b || !c) return;
+    if (errors.length) { b.style.display = 'inline-flex'; c.textContent = errors.length; }
+    else b.style.display = 'none';
+  }
+  function showErrorPopup() {
+    const old = document.getElementById('sostk-err-overlay'); if (old) old.remove();
+    const ov = document.createElement('div');
+    ov.id = 'sostk-err-overlay';
+    ov.style.cssText = 'position:fixed;inset:0;z-index:100002;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
+    const btn = 'border:none;border-radius:7px;padding:5px 10px;font-weight:600;font-size:12px;cursor:pointer;';
+    const rows = errors.length ? errors.map(e => `
+      <div style="border:1px solid ${e.type==='warn'?'#78350f':'#7f1d1d'};background:${e.type==='warn'?'#1a1200':'#1f0d0d'};border-radius:8px;padding:8px 10px;margin-bottom:6px">
+        <div style="font-size:12px;font-weight:700;color:#e2e8f0">${e.type==='warn'?'⚠':'✕'} ${esc(e.label)}</div>
+        <div style="font-size:11.5px;color:#fca5a5;margin-top:2px">${esc(e.reason)}</div>
+      </div>`).join('') : '<div style="color:#64748b;font-size:12px">No errors logged. 🎉</div>';
+    ov.innerHTML = `
+      <div style="background:#0f172a;border:1px solid #334155;border-radius:14px;padding:16px;width:min(460px,92vw);max-height:80vh;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif;color:#e2e8f0;box-shadow:0 20px 60px rgba(0,0,0,.7)">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px">
+          <span style="font-size:14px;font-weight:700;flex:1">Build issues (${errors.length})</span>
+          <button id="sostk-err-copy"  style="${btn}background:#334155;color:#cbd5e1">Copy</button>
+          <button id="sostk-err-clear" style="${btn}background:#334155;color:#94a3b8">Clear</button>
+          <button id="sostk-err-close" style="${btn}background:#4f46e5;color:#fff">Close</button>
+        </div>
+        <div style="overflow-y:auto;padding-right:2px">${rows}</div>
+      </div>`;
+    document.body.appendChild(ov);
+    ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+    ov.querySelector('#sostk-err-close').onclick = () => ov.remove();
+    ov.querySelector('#sostk-err-clear').onclick = () => { errors = []; updateErrorBadge(); ov.remove(); };
+    ov.querySelector('#sostk-err-copy').onclick = () => {
+      const t = errors.map(e => `${e.type==='warn'?'WARN':'FAIL'} | ${e.label} | ${e.reason}`).join('\n');
+      navigator.clipboard.writeText(t).then(() => { const b = ov.querySelector('#sostk-err-copy'); b.textContent = 'Copied!'; setTimeout(() => b.textContent = 'Copy', 1200); }, () => {});
+    };
   }
 
   // ── Create a new repair ticket ────────────────────────────────
@@ -994,14 +1072,14 @@
 
     if (job.sosStatus) await setTicketStatus(job.sosStatus);
 
-    let quoteVal = job.quote;
-    if (job.needsQuote && !(quoteVal > 0)) {
-      const entered = await askQuote(labelOf(job));   // popup: type a number, or Skip
-      if (entered != null && entered > 0) quoteVal = entered;
-    }
-    if (quoteVal > 0) {
+    // Quote is optional. Use whatever's set (parsed number or the inline preview
+    // field). If the cell said "quote" and it's still blank, just skip it and log a
+    // warning — never block the build or fail the ticket over a missing quote.
+    if (job.quote > 0) {
       const q = findQuoteInput();
-      if (q) { setNativeValue(q, String(quoteVal)); await sleep(120); }
+      if (q) { setNativeValue(q, String(job.quote)); await sleep(120); }
+    } else if (job.needsQuote) {
+      logIssue('Quote left blank (cell said "quote") — ticket created without a quote.', 'warn');
     }
 
     const createBtn = Array.from(document.querySelectorAll('button')).find(b => /create ticket/i.test(b.textContent.trim()));
@@ -1015,7 +1093,7 @@
       const tk = latestTicket();
       job.ticket = tk || job.ticket;
       try { await addNote(tk, job.note); }
-      catch (e) { setStatus('⚠️ Ticket made, note skipped: ' + e.message); }
+      catch (e) { logIssue('Ticket created but note not added: ' + e.message, 'warn'); setStatus('⚠️ Ticket made, note skipped: ' + e.message); }
     }
   }
 
@@ -1318,14 +1396,14 @@
   async function setTicketStatus(statusText) {
     if (!statusText) return false;
     const trig = findStatusTrigger();
-    if (!trig) { setStatus('⚠️ Status control not found — left at default.'); return false; }
+    if (!trig) { logIssue('Status control not found — left at default.', 'warn'); setStatus('⚠️ Status control not found — left at default.'); return false; }
     openRadix(trig);
     const opts = await waitFor(() => {
       const o = Array.from(document.querySelectorAll('[role="option"],[role="menuitem"]'))
         .filter(e => e.offsetParent !== null && e.textContent.trim());
       return o.length ? o : null;
     }, 2500);
-    if (!opts) { setStatus('⚠️ Status list did not open — left at default.'); return false; }
+    if (!opts) { logIssue('Status list did not open — left at default.', 'warn'); setStatus('⚠️ Status list did not open — left at default.'); return false; }
     const want = statusText.replace(/\s+/g,' ').trim().toLowerCase();
     const norm = o => o.textContent.replace(/\s+/g,' ').trim().toLowerCase();
     const opt = opts.find(o => norm(o) === want)
@@ -1335,6 +1413,7 @@
       document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
       const names = opts.map(o => o.textContent.trim()).join(', ');
       console.warn('[Ticket Loader] Status "'+statusText+'" not found. Real SOS options are: ['+names+']');
+      logIssue(`Status "${statusText}" not applied — not in SOS list. Options: ${names}`, 'warn');
       setStatus(`⚠️ Status "${statusText}" not in list. Real options: ${names}`);
       return false;
     }
@@ -1375,38 +1454,6 @@
     const lab = Array.from(document.querySelectorAll('label')).find(l => /quote amount/i.test(l.textContent));
     if (lab) { const inp = (lab.parentElement||document).querySelector('input[type="number"]'); if (inp) return inp; }
     return document.querySelector('input[type="number"][step="0.01"]');
-  }
-
-  // Build-time popup for rows whose col-L quote cell held the word "quote".
-  // Resolves to a number, or null if the user skips.
-  function askQuote(label) {
-    return new Promise(resolve => {
-      const ov = document.createElement('div');
-      ov.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
-      ov.innerHTML = `
-        <div style="background:#0f172a;border:1px solid #334155;border-radius:14px;padding:18px;width:300px;
-          font-family:'Segoe UI',system-ui,sans-serif;color:#e2e8f0;box-shadow:0 20px 60px rgba(0,0,0,.7)">
-          <div style="font-size:13px;font-weight:700;margin-bottom:3px">Quote amount</div>
-          <div style="font-size:11px;color:#64748b;margin-bottom:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(label)}</div>
-          <input type="number" step="0.01" min="0" id="sostk-q-modal" placeholder="0.00"
-            style="width:100%;box-sizing:border-box;background:#1e293b;border:1px solid #6366f1;color:#e2e8f0;
-            border-radius:8px;padding:8px 10px;font-size:14px;outline:none">
-          <div style="display:flex;gap:6px;margin-top:12px">
-            <button id="sostk-q-ok" style="flex:1;padding:8px;border:none;border-radius:8px;
-              background:linear-gradient(135deg,#6366f1,#4f46e5);color:#fff;font-weight:600;cursor:pointer">Use this</button>
-            <button id="sostk-q-skip" style="padding:8px 12px;border:none;border-radius:8px;
-              background:#334155;color:#94a3b8;font-weight:600;cursor:pointer">Skip</button>
-          </div>
-        </div>`;
-      document.body.appendChild(ov);
-      const input = ov.querySelector('#sostk-q-modal');
-      setTimeout(() => input.focus(), 30);
-      const done = v => { ov.remove(); resolve(v); };
-      const take = () => { const n = parseFloat(input.value); done(isNaN(n) ? null : n); };
-      ov.querySelector('#sostk-q-ok').addEventListener('click', take);
-      ov.querySelector('#sostk-q-skip').addEventListener('click', () => done(null));
-      input.addEventListener('keydown', e => { if (e.key === 'Enter') take(); if (e.key === 'Escape') done(null); });
-    });
   }
 
   // ═════════════════════════════════════════════════════════════
