@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '1.7';
+  const SCRIPT_VERSION = '1.8';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -555,6 +555,7 @@
 
       <button class="sostk-btn sostk-btn-primary sostk-btn-sm" id="sostk-save-cfg">Save settings</button>
       <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-reset-cfg" style="margin-left:6px">Reset maps</button>
+      <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-probe" style="margin-left:6px">🔍 Probe status</button>
       <hr class="sostk-divider">
       <p class="sostk-note">
         <b>route</b> values: <b>ticket</b> (create repair) · <b>sale</b> (product) · <b>manual</b> (skip → Not completed).<br>
@@ -625,6 +626,34 @@
   document.getElementById('sostk-reset-cfg').addEventListener('click', () => {
     cfg.cols = { ...COL_DEFAULTS }; cfg.statusMap = { ...STATUS_MAP_DEFAULT }; cfg.issueMap = { ...ISSUE_MAP_DEFAULT };
     fillSettings(); setStatus('Maps reset to defaults — Save to keep.');
+  });
+
+  // Diagnostic: open the Status dropdown, read the real option names + the first
+  // option's HTML, log them and copy to clipboard. Click this on the Ticket tab.
+  document.getElementById('sostk-probe').addEventListener('click', async () => {
+    const trig = findStatusTrigger();
+    if (!trig) { setStatus('⚠️ Open the Ticket tab (so the Status box shows), then Probe.'); return; }
+    trig.click();
+    const opts = await waitFor(() => {
+      const o = Array.from(document.querySelectorAll('[role="option"]')).filter(e => e.offsetParent !== null);
+      return o.length ? o : null;
+    }, 2500);
+    if (!opts) {
+      const portal = document.querySelector('[data-radix-popper-content-wrapper]') ||
+                     document.querySelector('[role="listbox"]');
+      const html = portal ? portal.outerHTML.slice(0, 5000) : '(no dropdown portal found)';
+      console.log('[Ticket Loader] Status dropdown HTML:\n' + html);
+      try { await navigator.clipboard.writeText('STATUS DROPDOWN HTML:\n' + html); } catch {}
+      setStatus('Options not role=option — DOM dumped to console + clipboard. Paste to Claude.');
+      return;
+    }
+    const names = opts.map(o => o.textContent.trim());
+    const report = 'STATUS OPTIONS (' + names.length + '): ' + names.join(' | ') +
+                   '\n\nFIRST OPTION HTML:\n' + opts[0].outerHTML;
+    console.log('[Ticket Loader] ' + report);
+    try { await navigator.clipboard.writeText(report); setStatus('✓ ' + names.length + ' status options copied to clipboard — paste to Claude.'); }
+    catch { setStatus('Options: ' + names.join(', ')); }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
   });
 
   // ═════════════════════════════════════════════════════════════
