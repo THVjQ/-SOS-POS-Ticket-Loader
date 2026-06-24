@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      2.0
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '1.9';
+  const SCRIPT_VERSION = '2.0';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -218,24 +218,59 @@
   const COL_DEFAULTS = { TICKET_B: 1, TICKET_C: 2, STATUS: 3, CASH: 4, EFTPOS: 5, QUOTE: 11 };
 
   // ═════════════════════════════════════════════════════════════
-  // STATUS MAP  (your col-D code → how to route + which SOS POS status)
-  //  route: 'ticket' (repair) · 'sale' (product) · 'note' (add note only) · 'manual' (defer)
-  //  sos:   text to match against the SOS POS Status dropdown options.
-  //  Edit freely in Settings — the `sos` strings must match your real
-  //  dropdown option text (the form defaults to "Repairing").
+  // STATUS MAP  (your sheet col-D value → route + SOS POS status)
+  //  route: 'ticket' (repair) · 'sale' (product) · 'manual' (skip → Not completed)
+  //  sos:   exact SOS POS status text (confirmed list, doc 7).
+  //  Some sheet codes don't map perfectly to a SOS status — best-effort guesses
+  //  are marked. Edit any in Settings → Status map.
+  //  Existing ticket # in col C + a ticket route = Update (set status + note).
   // ═════════════════════════════════════════════════════════════
   const STATUS_MAP_DEFAULT = {
-    'REFUND':           { route: 'manual', sos: '' },
-    'SYD/TO SEND':      { route: 'ticket', sos: 'Repairing' },
-    'SYD':              { route: 'ticket', sos: 'Repairing' },
-    'TO SEND':          { route: 'ticket', sos: 'Repairing' },
-    'WAITING ON CX':    { route: 'ticket', sos: 'Waiting on Customer' },
-    'BAR':              { route: 'ticket', sos: 'Repairing' },
-    'NOTE':             { route: 'manual', sos: '' },
-    'ORDER':            { route: 'ticket', sos: 'Waiting on Parts' },
-    'PART NOT ORDERED': { route: 'ticket', sos: 'Waiting on Parts' },
-    'PART ORDERED':     { route: 'ticket', sos: 'Waiting on Parts' },
-    'ORDERED':          { route: 'ticket', sos: 'Waiting on Parts' },
+    // workflow / repair
+    'REPAIRING':          { route: 'ticket', sos: 'Repairing' },
+    'DIAGNOSTIC':         { route: 'ticket', sos: 'Diagnostic' },
+    'DATA':               { route: 'ticket', sos: 'Repairing' },        // best-effort
+    'WAITING ON CX':      { route: 'ticket', sos: 'Waiting on CX' },
+    'WARRANTY':           { route: 'ticket', sos: 'Warranty' },
+    'PART ORDERED':       { route: 'ticket', sos: 'Part Ordered' },
+    'PART NOT ORDERED':   { route: 'ticket', sos: 'Part Not Ordered' },
+    'PART ARRIVED':       { route: 'ticket', sos: 'Part Arrived' },
+    'ORDER':              { route: 'ticket', sos: 'Part Ordered' },     // alias
+    'ORDERED':            { route: 'ticket', sos: 'Part Ordered' },     // alias
+    'BAR':                { route: 'ticket', sos: 'Repairing' },        // best-effort
+    'ENQUIRY':            { route: 'ticket', sos: 'Enquiry' },
+    'BOOKING':            { route: 'ticket', sos: 'Booking' },
+    'DEPOSIT':            { route: 'ticket', sos: 'Deposit' },
+    'QUOTE':              { route: 'ticket', sos: 'Quote' },
+    'VIRUS':              { route: 'ticket', sos: 'Virus' },
+    'MISSING':            { route: 'ticket', sos: 'Missing' },
+    'CALL OUT':           { route: 'ticket', sos: 'CALL OUT' },
+    'LAY-BY':             { route: 'ticket', sos: 'LayBy' },
+    'LAYBY':              { route: 'ticket', sos: 'LayBy' },
+    'POSTED':             { route: 'ticket', sos: 'Posted' },
+    'DISPOSE':            { route: 'ticket', sos: 'Dispose' },
+    'PICK UP READY':      { route: 'ticket', sos: 'Pick Up Ready' },
+    // microsoldering / send-away
+    'SENT TO ARMI':       { route: 'ticket', sos: 'Micro Sent' },
+    'SYD/TO SEND':        { route: 'ticket', sos: 'Micro To Send' },
+    'SYD/SENT':           { route: 'ticket', sos: 'Micro Sent' },
+    'SYD/BACK':           { route: 'ticket', sos: 'Micro Back' },
+    // no-fix
+    'NO FIX - IN STORE':  { route: 'ticket', sos: 'No Fix - In Store' },
+    'NO FIX - COLLECTED': { route: 'ticket', sos: 'No Fix - Collected' },
+    // money / closed
+    'PAID':               { route: 'ticket', sos: 'Paid' },
+    'PART PAID':          { route: 'ticket', sos: 'Part Paid' },
+    'PAID & COLLECTED':   { route: 'ticket', sos: 'Paid & Collected' },
+    'COLLECTED':          { route: 'ticket', sos: 'Collected' },
+    'BALANCED':           { route: 'ticket', sos: 'Paid' },             // best-effort
+    'CANCELLED':          { route: 'ticket', sos: 'Cancelled' },
+    'REFUND':             { route: 'ticket', sos: 'Refunded' },         // was skip — now applies Refunded
+    'REFUNDED':           { route: 'ticket', sos: 'Refunded' },
+    // sales
+    'PURCHASED ITEM':     { route: 'sale',   sos: '' },
+    // skipped (no SOS status equivalent)
+    'NOTE':               { route: 'manual', sos: '' },
   };
 
   // ═════════════════════════════════════════════════════════════
@@ -661,9 +696,9 @@
   document.getElementById('sostk-probe').addEventListener('click', async () => {
     const trig = findStatusTrigger();
     if (!trig) { setStatus('⚠️ Open the Ticket tab (so the Status box shows), then Probe.'); return; }
-    trig.click();
+    openRadix(trig);
     const opts = await waitFor(() => {
-      const o = Array.from(document.querySelectorAll('[role="option"]')).filter(e => e.offsetParent !== null);
+      const o = Array.from(document.querySelectorAll('[role="option"],[role="menuitem"]')).filter(e => e.offsetParent !== null && e.textContent.trim());
       return o.length ? o : null;
     }, 2500);
     if (!opts) {
@@ -1277,19 +1312,20 @@
     if (target.checkbox.getAttribute('aria-checked') !== 'true') { target.checkbox.click(); await sleep(140); }
   }
 
-  // Status — radix Select. Open it, read the REAL options, pick the match. On a
-  // miss it leaves the default and reports the available option names so the
-  // status map can be corrected in Settings (no more silent default "Repairing").
+  // Status — a radix dropdown MENU (role="menuitem" items, opens on pointerdown),
+  // not a Select. Open it, read the real items, pick the match. On a miss it leaves
+  // the default and reports the real option names (status bar + console).
   async function setTicketStatus(statusText) {
     if (!statusText) return false;
     const trig = findStatusTrigger();
-    if (!trig) { setStatus('⚠️ Status dropdown not found — left at default.'); return false; }
-    trig.click();
+    if (!trig) { setStatus('⚠️ Status control not found — left at default.'); return false; }
+    openRadix(trig);
     const opts = await waitFor(() => {
-      const o = Array.from(document.querySelectorAll('[role="option"]')).filter(e => e.offsetParent !== null);
+      const o = Array.from(document.querySelectorAll('[role="option"],[role="menuitem"]'))
+        .filter(e => e.offsetParent !== null && e.textContent.trim());
       return o.length ? o : null;
     }, 2500);
-    if (!opts) { setStatus('⚠️ Status options did not open — left at default.'); return false; }
+    if (!opts) { setStatus('⚠️ Status list did not open — left at default.'); return false; }
     const want = statusText.replace(/\s+/g,' ').trim().toLowerCase();
     const norm = o => o.textContent.replace(/\s+/g,' ').trim().toLowerCase();
     const opt = opts.find(o => norm(o) === want)
@@ -1297,26 +1333,35 @@
              || opts.find(o => want.includes(norm(o)));
     if (!opt) {
       document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
-      const names = opts.map(o=>o.textContent.trim()).join(', ');
+      const names = opts.map(o => o.textContent.trim()).join(', ');
       console.warn('[Ticket Loader] Status "'+statusText+'" not found. Real SOS options are: ['+names+']');
       setStatus(`⚠️ Status "${statusText}" not in list. Real options: ${names}`);
       return false;
     }
-    opt.click(); await sleep(180); return true;
+    opt.click(); await sleep(200); return true;
   }
 
-  // The Status select trigger sits under a <label>Status</label>; scope to that
-  // first, then fall back to a role=combobox whose value reads like a status.
+  // The Status control sits under a <label>Status</label>. It may be a radix Select
+  // (role=combobox) or a dropdown-menu trigger (aria-haspopup=menu) — accept either,
+  // and skip a disabled one (e.g. a locked, already-paid sale).
   function findStatusTrigger() {
     const lab = Array.from(document.querySelectorAll('label')).find(l => l.textContent.trim() === 'Status');
     if (lab && lab.parentElement) {
-      const btn = lab.parentElement.querySelector('button[role="combobox"]');
-      if (btn) return btn;
+      const btn = lab.parentElement.querySelector('button[role="combobox"],button[aria-haspopup="menu"],button');
+      if (btn && !btn.disabled) return btn;
     }
-    return Array.from(document.querySelectorAll('button[role="combobox"]'))
-      .find(b => { const sp = b.querySelector('span'); return sp &&
-        /repairing|waiting|ready|complete|progress|pending|collected|parts|customer|booked|diagnos/i.test(sp.textContent) &&
+    return Array.from(document.querySelectorAll('button[role="combobox"],button[aria-haspopup="menu"]'))
+      .find(b => { const sp = b.querySelector('span'); return sp && !b.disabled &&
+        /repairing|waiting|ready|paid|collected|part|quote|booking|diagnos|warranty|cancel|deposit|enquiry|posted|micro|refund/i.test(sp.textContent) &&
         !/issue|select issues/i.test(b.textContent); });
+  }
+
+  // Open a radix Select/Menu trigger reliably — they react to pointerdown, not a
+  // bare click. (This was the silent status bug: .click() alone never opened it.)
+  function openRadix(el) {
+    try { el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); } catch {}
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    el.click();
   }
 
   // Find a visible popup option whose text contains `text`.
