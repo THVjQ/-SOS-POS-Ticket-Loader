@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '1.3';
+  const SCRIPT_VERSION = '1.4';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -234,6 +234,41 @@
   };
 
   // ═════════════════════════════════════════════════════════════
+  // ISSUE MAP  (parser job label → SOS POS "Issues" checklist name)
+  //  The SOS list: Screen · Battery · Data Transfer · Back Glass ·
+  //  Charging Issues · Charging Port · Data Recovery · Diagnose · Face ID ·
+  //  Frame · Front Camera · Housing / Cosmetic · No Power · Other ·
+  //  Rear Camera · Software / Update · Speaker · Virus Removal · Water Damage ·
+  //  Other - see notes.  Matching is exact first, then "contains", then
+  //  "Other - see notes" as a last resort so the required field is never empty.
+  //  Editable in Settings.
+  // ═════════════════════════════════════════════════════════════
+  const ISSUE_MAP_DEFAULT = {
+    'Screen':              'Screen',
+    'OLED':                'Screen',
+    'LCD':                 'Screen',
+    'Digitizer':           'Screen',
+    'Battery':             'Battery',
+    'Charging Port':       'Charging Port',
+    'Charging Port Clean': 'Charging Port',
+    'Rear Glass':          'Back Glass',
+    'Rear Housing':        'Housing / Cosmetic',
+    'Housing':             'Housing / Cosmetic',
+    'Camera':              'Rear Camera',
+    'Camera Glass':        'Rear Camera',
+    'Data Transfer':       'Data Transfer',
+    'Data Recovery':       'Data Recovery',
+    'Virus Clean':         'Virus Removal',
+    'Restore':             'Software / Update',
+    'Speaker':             'Speaker',
+    'Water Damage':        'Water Damage',
+    'Power Button':        'Other',
+    'Sim Tray':            'Other',
+    'Signal Flex':         'Other',
+    'Microphone':          'Other',
+  };
+
+  // ═════════════════════════════════════════════════════════════
   // Settings
   // ═════════════════════════════════════════════════════════════
   const DEFAULTS = {
@@ -246,12 +281,14 @@
     sheetSecret: '',           // optional shared secret matching the Apps Script
     cols: { ...COL_DEFAULTS },
     statusMap: { ...STATUS_MAP_DEFAULT },
+    issueMap: { ...ISSUE_MAP_DEFAULT },
   };
   function loadCfg() {
     try {
       const c = Object.assign({}, DEFAULTS, JSON.parse(GM_getValue('sostk_cfg','{}')));
       c.cols      = Object.assign({}, COL_DEFAULTS, c.cols || {});
       c.statusMap = Object.assign({}, STATUS_MAP_DEFAULT, c.statusMap || {});
+      c.issueMap  = Object.assign({}, ISSUE_MAP_DEFAULT, c.issueMap || {});
       return c;
     } catch { return JSON.parse(JSON.stringify(DEFAULTS)); }
   }
@@ -497,6 +534,10 @@
         <label class="sostk-label">Status map — col D code → route + SOS status (JSON)</label>
         <textarea class="sostk-textarea" id="sostk-statusmap"></textarea>
       </div>
+      <div class="sostk-field">
+        <label class="sostk-label">Issue map — parser label → SOS issue name (JSON)</label>
+        <textarea class="sostk-textarea" id="sostk-issuemap"></textarea>
+      </div>
 
       <button class="sostk-btn sostk-btn-primary sostk-btn-sm" id="sostk-save-cfg">Save settings</button>
       <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-reset-cfg" style="margin-left:6px">Reset maps</button>
@@ -531,6 +572,7 @@
   const $delay    = document.getElementById('sostk-step-delay');
   const $cols     = document.getElementById('sostk-cols');
   const $statusmap= document.getElementById('sostk-statusmap');
+  const $issuemap = document.getElementById('sostk-issuemap');
   const $writeback= document.getElementById('sostk-writeback');
   const $webapp   = document.getElementById('sostk-webapp');
   const $secret   = document.getElementById('sostk-secret');
@@ -542,6 +584,7 @@
     $delay.value    = cfg.stepDelay;
     $cols.value     = JSON.stringify(cfg.cols, null, 0);
     $statusmap.value= JSON.stringify(cfg.statusMap, null, 2);
+    $issuemap.value = JSON.stringify(cfg.issueMap, null, 2);
     $writeback.value= cfg.writeback || 'off';
     $webapp.value   = cfg.webAppUrl || '';
     $secret.value   = cfg.sheetSecret || '';
@@ -560,11 +603,13 @@
     catch { setStatus('⚠️ Column map JSON invalid — not saved.'); return; }
     try { cfg.statusMap = JSON.parse($statusmap.value); }
     catch { setStatus('⚠️ Status map JSON invalid — not saved.'); return; }
+    try { cfg.issueMap = JSON.parse($issuemap.value); }
+    catch { setStatus('⚠️ Issue map JSON invalid — not saved.'); return; }
     saveCfg(cfg); setStatus('✓ Settings saved.');
     if (rawCache) doParse(rawCache);
   });
   document.getElementById('sostk-reset-cfg').addEventListener('click', () => {
-    cfg.cols = { ...COL_DEFAULTS }; cfg.statusMap = { ...STATUS_MAP_DEFAULT };
+    cfg.cols = { ...COL_DEFAULTS }; cfg.statusMap = { ...STATUS_MAP_DEFAULT }; cfg.issueMap = { ...ISSUE_MAP_DEFAULT };
     fillSettings(); setStatus('Maps reset to defaults — Save to keep.');
   });
 
@@ -837,7 +882,7 @@
     await createCustomer(job.customer);
 
     if (job.device) await setDeviceField(job.device);
-    if (job.jobs.length) await setIssues(job.jobs);
+    await setIssues(job.jobs);   // always — falls back to "Other - see notes" if none matched
 
     if (cfg.doaDefault) { const r = document.getElementById('doa-'+cfg.doaDefault); if (r && r.getAttribute('aria-checked')!=='true') { r.click(); await sleep(120); } }
 
@@ -982,20 +1027,76 @@
     await sleep(160);
   }
 
-  // Issues — combobox that opens a checklist. Click each parsed job that matches.
+  // Issues — combobox opening a popover of role="checkbox" rows. Each row's
+  // name is the leading text node of its .font-medium div (a "Common" badge may
+  // follow). We map parser labels → SOS issue names, tick the matches, and fall
+  // back to "Other - see notes" so the required field is never left empty.
   async function setIssues(labels) {
     const btn = Array.from(document.querySelectorAll('button[role="combobox"]'))
-      .find(b => /issue/i.test(b.textContent) || /select issues/i.test(b.textContent));
+      .find(b => /select issues|issues?\b/i.test(b.textContent) && !/repairing|status/i.test(b.textContent));
     if (!btn) throw new Error('Issues selector not found');
-    btn.click();
-    await waitFor(() => document.querySelector('[role="listbox"],[role="dialog"] [role="option"],[role="menu"]'), 2500);
-    for (const lbl of labels) {
-      const opt = pickOptionByText(lbl);
-      if (opt) { opt.click(); await sleep(140); }
+    if (btn.getAttribute('aria-expanded') !== 'true') btn.click();
+
+    const pop = await waitFor(() => findIssuesPopup(), 3000);
+    if (!pop) throw new Error('Issues popup did not open');
+    await sleep(160);
+
+    const rows = issueRows(pop);
+    if (!rows.length) throw new Error('No issue checkboxes found in popup');
+
+    let any = false;
+    for (const lbl of (labels || [])) {
+      const target = matchIssue(lbl, rows);
+      if (target) { await toggleIssueOn(target); any = true; }
     }
-    // close the popup
-    document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', code:'Escape', bubbles:true }));
-    await sleep(180);
+    if (!any) {
+      const other = rows.find(r => /^other\s*-\s*see notes$/i.test(r.name)) || rows.find(r => /^other$/i.test(r.name));
+      if (other) { await toggleIssueOn(other); }
+    }
+
+    // close the popover
+    btn.click();
+    await sleep(120);
+    if (findIssuesPopup()) { document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true})); await sleep(120); }
+  }
+
+  // The issues popover is a radix popover (role="dialog") full of checkbox rows.
+  function findIssuesPopup() {
+    return Array.from(document.querySelectorAll('[role="dialog"],[data-radix-popper-content-wrapper] [role="dialog"],[data-side]'))
+      .find(d => d.querySelector && d.querySelector('button[role="checkbox"]') &&
+                 /screen|battery|water damage|charging/i.test(d.textContent)) || null;
+  }
+
+  // Build [{ name, rowEl, checkbox }] from the popover, names cleaned of badges.
+  function issueRows(pop) {
+    return Array.from(pop.querySelectorAll('button[role="checkbox"]')).map(cb => {
+      const rowEl = cb.closest('div.flex.items-center') || cb.parentElement;
+      const nameEl = rowEl && rowEl.querySelector('.font-medium');
+      let name = '';
+      if (nameEl) {
+        const tn = Array.from(nameEl.childNodes).find(n => n.nodeType === 3 && n.textContent.trim());
+        name = tn ? tn.textContent.trim() : nameEl.textContent.replace(/\bcommon\b/ig,'').trim();
+      }
+      return { name, rowEl, checkbox: cb };
+    }).filter(r => r.name);
+  }
+
+  // parser label → SOS issue row, via the editable issue map then fuzzy fallback.
+  function matchIssue(jobLabel, rows) {
+    const want = (cfg.issueMap[jobLabel] || jobLabel).toLowerCase().trim();
+    let r = rows.find(x => x.name.toLowerCase() === want);
+    if (r) return r;
+    r = rows.find(x => x.name.toLowerCase().includes(want) || want.includes(x.name.toLowerCase()));
+    return r || null;
+  }
+
+  // Tick a checkbox row if it isn't already checked (tries row then checkbox).
+  async function toggleIssueOn(target) {
+    if (!target || !target.checkbox) return;
+    if (target.checkbox.getAttribute('aria-checked') === 'true') return;
+    (target.rowEl || target.checkbox).click();
+    await sleep(140);
+    if (target.checkbox.getAttribute('aria-checked') !== 'true') { target.checkbox.click(); await sleep(140); }
   }
 
   // Status — radix Select. Click trigger, click the matching option.
@@ -1260,3 +1361,129 @@
   }
 
 })();
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  GOOGLE SHEETS WRITE-BACK — APPS SCRIPT (the bundled "second half")        ║
+// ║                                                                            ║
+// ║  This block does NOT run in Tampermonkey. It runs inside your Google Sheet ║
+// ║  on Google's servers. Tampermonkey simply ignores it (it is all comments).  ║
+// ║                                                                            ║
+// ║  ONE-TIME SETUP:                                                           ║
+// ║   1. Open your sheet -> Extensions -> Apps Script.                         ║
+// ║   2. Copy the lines below (strip the leading "// "), paste into a new      ║
+// ║      Apps Script file, edit the CONFIG block, Save.                        ║
+// ║   3. Deploy -> New deployment -> Web app: Execute as Me, Access Anyone.    ║
+// ║   4. Paste the /exec URL into this script: Settings -> Web App URL.        ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+// ----8<---- BEGIN APPS SCRIPT (paste into Google Sheets, not Tampermonkey) ----8<----
+//
+// /**
+//  * SOS POS Ticket Loader — write-back web app
+//  * ------------------------------------------------------------------
+//  * Receives finished ticket numbers from the Tampermonkey Ticket Loader
+//  * and writes them into this sheet. Each incoming row is matched to a
+//  * sheet row by its DESCRIPTION text, then the ticket number is written
+//  * into the TICKET column (and, optionally, the status into the STATUS
+//  * column).
+//  *
+//  * SETUP
+//  *   1. Open your tracking sheet → Extensions → Apps Script.
+//  *   2. Paste this whole file in (replace anything there).
+//  *   3. Edit the CONFIG block below to match your sheet.
+//  *   4. Deploy → New deployment → type "Web app".
+//  *        • Execute as:  Me
+//  *        • Who has access:  Anyone
+//  *      Copy the /exec URL it gives you.
+//  *   5. In the Ticket Loader → Settings, paste that URL into
+//  *      "Apps Script Web App URL", set Write-back to Manual or Auto,
+//  *      and (optionally) set a matching secret. Save.
+//  *
+//  * NOTE: column letters are 1:1 with what the userscript sends.
+//  *       Matching is by exact description text (whitespace-normalised).
+//  *       If two rows share an identical description, the first is used.
+//  */
+//
+// // ─────────────── CONFIG — edit these ───────────────
+// var CONFIG = {
+//   SHEET_NAME: '',     // exact tab name, e.g. 'June 2026'. Leave '' for the active sheet.
+//   DESC_COL:   'O',    // description column (the col after PIN in your paste) — ADJUST
+//   TICKET_COL: 'C',    // where the ticket number is written
+//   STATUS_COL: 'D',    // status column ('' to skip writing status)
+//   HEADER_ROWS: 1,     // rows to skip at the top before data starts
+//   SECRET:     '',     // leave '' for none, or set to match the Loader's "Shared secret"
+// };
+// // ───────────────────────────────────────────────────
+//
+// function doPost(e) {
+//   try {
+//     var body = JSON.parse(e.postData.contents || '{}');
+//     if (CONFIG.SECRET && String(body.secret || '') !== CONFIG.SECRET) {
+//       return _json({ error: 'bad secret' });
+//     }
+//     var rows = body.rows || [];
+//     if (!rows.length) return _json({ updated: 0 });
+//
+//     var ss = SpreadsheetApp.getActiveSpreadsheet();
+//     var sh = CONFIG.SHEET_NAME ? ss.getSheetByName(CONFIG.SHEET_NAME) : ss.getActiveSheet();
+//     if (!sh) return _json({ error: 'sheet not found: ' + CONFIG.SHEET_NAME });
+//
+//     var lastRow = sh.getLastRow();
+//     if (lastRow < 1) return _json({ updated: 0 });
+//
+//     // Read the whole description column once and normalise for matching.
+//     var descCol = _colToNum(CONFIG.DESC_COL);
+//     var descVals = sh.getRange(1, descCol, lastRow, 1).getValues()
+//       .map(function (r) { return _norm(r[0]); });
+//
+//     var ticketCol = _colToNum(CONFIG.TICKET_COL);
+//     var statusCol = CONFIG.STATUS_COL ? _colToNum(CONFIG.STATUS_COL) : 0;
+//
+//     var used = {};      // guard against writing two tickets to the same row
+//     var updated = 0, unmatched = [];
+//
+//     rows.forEach(function (row) {
+//       var key = _norm(row.key);
+//       if (!key || !row.ticket) return;
+//       // find first matching row at/after the header that isn't already used
+//       var idx = -1;
+//       for (var i = CONFIG.HEADER_ROWS; i < descVals.length; i++) {
+//         if (descVals[i] === key && !used[i]) { idx = i; break; }
+//       }
+//       if (idx < 0) { unmatched.push(row.key); return; }
+//       used[idx] = true;
+//       var rn = idx + 1; // 1-based row number
+//       sh.getRange(rn, ticketCol).setValue(row.ticket);
+//       if (statusCol && row.status) sh.getRange(rn, statusCol).setValue(row.status);
+//       updated++;
+//     });
+//
+//     return _json({ updated: updated, unmatched: unmatched });
+//   } catch (err) {
+//     return _json({ error: String(err) });
+//   }
+// }
+//
+// // Quick browser check that the deployment is live (visit the /exec URL).
+// function doGet() {
+//   return _json({ ok: true, msg: 'SOS POS write-back web app is live. POST rows to update.' });
+// }
+//
+// function _json(obj) {
+//   return ContentService.createTextOutput(JSON.stringify(obj))
+//     .setMimeType(ContentService.MimeType.JSON);
+// }
+//
+// function _norm(v) {
+//   return String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+// }
+//
+// // 'A' -> 1, 'C' -> 3, 'AA' -> 27
+// function _colToNum(letters) {
+//   var s = String(letters).toUpperCase(), n = 0;
+//   for (var i = 0; i < s.length; i++) n = n * 26 + (s.charCodeAt(i) - 64);
+//   return n;
+// }
+//
+// ----8<---- END APPS SCRIPT ----8<----
