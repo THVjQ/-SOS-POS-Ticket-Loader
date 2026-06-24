@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.5';
+  const SCRIPT_VERSION = '2.6';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -822,6 +822,11 @@
         else                                        route = 'manual';
       }
 
+      // Walk-in = no customer name AND no existing ticket # → always a Sale, never a
+      // repair ticket. (Named customers / existing tickets keep their route.)
+      const hasName = !!(r.name && r.name.trim() && !/^\(?no name\)?$/i.test(r.name.trim()));
+      if (!ticket && !hasName && route === 'ticket') route = 'sale';
+
       // Quote + needs-popup flag depend on route.
       let quote = 0, needsQuote = false;
       if (route === 'sale')        quote = payNum || qNum;
@@ -1130,17 +1135,36 @@
     if (createBtn.disabled) throw new Error('Create Ticket stayed disabled — a required field (device/issues) likely did not stick. Form left open.');
     createBtn.click();
     await sleep(cfg.stepDelay + 400);
+    job.ticket = latestTicket() || job.ticket;
+
+    // Repaired & collected/paid → take the payment for the respective amount on the
+    // ticket's new board row, then re-assert the status so it sticks.
+    if (isPaidStatus(job.sosStatus) && payAmount(job) > 0) {
+      await sleep(cfg.stepDelay + 200);
+      let row = job.ticket ? findTicketRow(job.ticket) : null;
+      if (row) {
+        await payOnRow(row, job);
+        row = findTicketRow(job.ticket) || row;
+        if (row) await setRowStatus(row, job.sosStatus);
+      } else {
+        logIssue(`Couldn't find the new row for ${job.ticket||'this ticket'} to take the $${payAmount(job).toFixed(2)} payment — take it manually.`, 'warn');
+      }
+    }
 
     if (cfg.addNotes && job.note) {
-      const tk = latestTicket();
-      job.ticket = tk || job.ticket;
-      try { await addNote(tk, job.note); }
+      const row = job.ticket ? findTicketRow(job.ticket) : null;
+      try { if (row) await addNoteOnRow(row, job.note); else await addNote(job.ticket, job.note); }
       catch (e) { logIssue('Ticket created but note not added: ' + e.message, 'warn'); setStatus('⚠️ Ticket made, note skipped: ' + e.message); }
     }
   }
 
   // Make an error that means "skip this row" (auto-advance, no retry/freeze).
   function skipError(msg) { const e = new Error(msg); e.skip = true; return e; }
+
+  // Statuses that mean the repair is collected/paid → take payment for the amount.
+  const PAID_STATUSES = ['paid', 'collected', 'paid & collected', 'part paid'];
+  function isPaidStatus(s) { return !!s && PAID_STATUSES.includes(String(s).trim().toLowerCase()); }
+  function payAmount(job) { return round2((job.cashAmt||0)+(job.eftAmt||0)) || round2(job.quote||0); }
 
   // Brief non-blocking toast (auto-dismisses).
   function showSkipBox(msg) {
@@ -1191,13 +1215,20 @@
   //  Needs the board/search DOM to open a ticket. Until that's wired, if it can't
   //  find the ticket it auto-skips (toast + advance) instead of freezing.
   async function updateTicket(job) {
-    const row = findTicketRow(job.ticket);
+    let row = findTicketRow(job.ticket);
     if (!row) {
       showSkipBox(`Ticket ${job.ticket} isn't on the board — skipped (only board-visible tickets can be updated).`);
       throw skipError(`Ticket ${job.ticket} not on board — auto-skipped.`);
     }
     row.scrollIntoView({ block:'center' }); await sleep(150);
+
+    // Collected/paid → take payment first (it may change status), then assert status.
+    if (isPaidStatus(job.sosStatus) && payAmount(job) > 0) {
+      await payOnRow(row, job);
+      row = findTicketRow(job.ticket) || row;
+    }
     if (job.sosStatus)            await setRowStatus(row, job.sosStatus);
+    row = findTicketRow(job.ticket) || row;
     if (cfg.addNotes && job.note) await addNoteOnRow(row, job.note);
   }
 
@@ -1244,7 +1275,7 @@
   function round2(x) { return Math.round(x*100)/100; }
 
   async function payForSale(job, dialog) {
-    const total = round2(job.quote || 0);
+    const total = round2(job.quote || ((job.cashAmt||0) + (job.eftAmt||0)));
     if (total <= 0) { // nothing to pay — try to complete as-is
       const c0 = findCompletePaymentBtn(dialog);
       if (c0 && !c0.disabled) { c0.click(); await waitFor(() => !findSaleCheckoutDialog(), 6000); }
@@ -1300,6 +1331,23 @@
   }
   function findCompletePaymentBtn(dialog) {
     return Array.from(dialog.querySelectorAll('button')).find(b => /complete payment/i.test(b.textContent));
+  }
+
+  // Take payment on a board row: click its Checkout button, then reuse the sale
+  // checkout dialog logic with the row's amounts. Non-fatal — warns on failure.
+  async function payOnRow(row, job) {
+    const co = row.querySelector('button[title="Checkout"]');
+    if (!co) { logIssue('Checkout button not found on row — take payment manually.', 'warn'); return false; }
+    co.click();
+    const dialog = await waitFor(() => findSaleCheckoutDialog(), 5000);
+    if (!dialog) { logIssue('Checkout dialog did not open — take payment manually.', 'warn'); return false; }
+    await sleep(cfg.stepDelay);
+    try { await payForSale(job, dialog); return true; }
+    catch (e) {
+      logIssue('Payment not completed (' + e.message + ') — left for you.', 'warn');
+      document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })); await sleep(150);
+      return false;
+    }
   }
 
   // ═════════════════════════════════════════════════════════════
