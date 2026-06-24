@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.3';
+  const SCRIPT_VERSION = '2.4';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -1081,7 +1081,19 @@
 
     await createCustomer(job.customer);
 
-    if (job.device) await setDeviceField(job.device);
+    // Device is required. If the parser found none, ask — showing the row note so
+    // you can read it and type the device, then continue (or skip the row).
+    let device = job.device;
+    if (!device) {
+      const entered = await askDevice(labelOf(job), job.note);
+      if (entered == null || !entered.trim()) {
+        showSkipBox(`No device for ${labelOf(job)} — row skipped.`);
+        throw skipError('No device entered — row skipped.');
+      }
+      device = entered.trim();
+      job.device = device;   // remember it (e.g. for retry)
+    }
+    await setDeviceField(device);
     await setIssues(job.jobs);   // always — falls back to "Other - see notes" if none matched
 
     if (cfg.doaDefault) { const r = document.getElementById('doa-'+cfg.doaDefault); if (r && r.getAttribute('aria-checked')!=='true') { r.click(); await sleep(120); } }
@@ -1125,6 +1137,40 @@
     t.textContent = '⏭ ' + msg;
     document.body.appendChild(t);
     setTimeout(() => t.remove(), 3500);
+  }
+
+  // Device-needed popup: shows the row's note so you can read what the device is,
+  // takes a typed device, and resolves to it (or null to skip the row).
+  function askDevice(label, note) {
+    return new Promise(resolve => {
+      const ov = document.createElement('div');
+      ov.style.cssText = 'position:fixed;inset:0;z-index:100004;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
+      ov.innerHTML = `
+        <div style="background:#0f172a;border:1px solid #334155;border-radius:14px;padding:18px;width:min(420px,92vw);
+          font-family:'Segoe UI',system-ui,sans-serif;color:#e2e8f0;box-shadow:0 20px 60px rgba(0,0,0,.7)">
+          <div style="font-size:14px;font-weight:700;margin-bottom:3px">Device needed</div>
+          <div style="font-size:11px;color:#64748b;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(label)}</div>
+          <div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Row note</div>
+          <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 10px;font-size:12px;color:#cbd5e1;max-height:120px;overflow-y:auto;white-space:pre-wrap;margin-bottom:12px">${esc(note || '(no note)')}</div>
+          <input id="sostk-dev-modal" placeholder="Type the device, e.g. iPhone 13"
+            style="width:100%;box-sizing:border-box;background:#1e293b;border:1px solid #6366f1;color:#e2e8f0;
+            border-radius:8px;padding:9px 10px;font-size:14px;outline:none">
+          <div style="display:flex;gap:6px;margin-top:12px">
+            <button id="sostk-dev-ok" style="flex:1;padding:9px;border:none;border-radius:8px;
+              background:linear-gradient(135deg,#6366f1,#4f46e5);color:#fff;font-weight:600;cursor:pointer">Use &amp; continue</button>
+            <button id="sostk-dev-skip" style="padding:9px 12px;border:none;border-radius:8px;
+              background:#334155;color:#94a3b8;font-weight:600;cursor:pointer">Skip row</button>
+          </div>
+        </div>`;
+      document.body.appendChild(ov);
+      const input = ov.querySelector('#sostk-dev-modal');
+      setTimeout(() => input.focus(), 30);
+      const done = v => { ov.remove(); resolve(v); };
+      const take = () => done(input.value.trim() || null);
+      ov.querySelector('#sostk-dev-ok').addEventListener('click', take);
+      ov.querySelector('#sostk-dev-skip').addEventListener('click', () => done(null));
+      input.addEventListener('keydown', e => { if (e.key === 'Enter') take(); if (e.key === 'Escape') done(null); });
+    });
   }
 
   // ── Update an existing ticket (status + note) ─────────────────
@@ -1245,8 +1291,10 @@
   // Create customer  (reused verbatim from the Sales Loader)
   // ═════════════════════════════════════════════════════════════
   async function createCustomer(c) {
+    await removeCustomerIfPresent();   // a leftover customer disables the + button
     const addBtn = findAddCustomerButton();
     if (!addBtn) throw new Error('Add-customer (+) button not found');
+    if (addBtn.disabled) { await removeCustomerIfPresent(); await sleep(150); }
     await sleep(120);
     addBtn.click();
 
@@ -1308,15 +1356,34 @@
   // markup differs, paste it and these three helpers get hardened.)
   // ═════════════════════════════════════════════════════════════
 
-  // Close any stray popovers/menus/dialogs from a prior row and clear the device
-  // field, so each ticket starts from a clean form (fixes cascading failures after
-  // a skipped/failed row).
+  // Close any stray popovers/menus/dialogs from a prior row, then REMOVE a leftover
+  // customer (a selected customer disables the + button → "Add Customer dialog did not
+  // open", and locks the form). Removing the customer resets the whole ticket form.
   async function resetTicketForm() {
-    for (let k = 0; k < 3; k++) { document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })); await sleep(70); }
+    for (let k = 0; k < 2; k++) { document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })); await sleep(60); }
+    await removeCustomerIfPresent();
     const dev = document.querySelector('input[placeholder*="device name" i]') ||
                 document.querySelector('input[placeholder*="Search or type device" i]');
     if (dev && dev.value) setNativeValue(dev, '');
     await sleep(120);
+  }
+
+  // The green "customer selected" banner carries an X button; clicking it clears the
+  // customer and re-enables the + button. Falls back to the × overlay on the input.
+  function findCustomerRemoveBtn() {
+    const banner = Array.from(document.querySelectorAll('div')).find(d => {
+      const cn = typeof d.className === 'string' ? d.className : '';
+      return (cn.includes('bg-green-50') || cn.includes('bg-green-900')) &&
+             d.querySelector('svg.lucide-check') && d.querySelector('button svg.lucide-x');
+    });
+    if (banner) { const b = banner.querySelector('button'); if (b && !b.disabled) return b; }
+    const clr = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '×' && !b.disabled);
+    return clr || null;
+  }
+  async function removeCustomerIfPresent() {
+    const rm = findCustomerRemoveBtn();
+    if (rm) { rm.click(); await sleep(cfg.stepDelay); return true; }
+    return false;
   }
 
   // Device — a cmdk command palette. Clear it, type, click an EXACT catalogue match
