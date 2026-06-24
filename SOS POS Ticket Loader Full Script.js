@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.4';
+  const SCRIPT_VERSION = '2.5';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -230,7 +230,9 @@
     'REPAIRING':          { route: 'ticket', sos: 'Repairing' },
     'DIAGNOSTIC':         { route: 'ticket', sos: 'Diagnostic' },
     'DATA':               { route: 'ticket', sos: 'Repairing' },        // best-effort
-    'WAITING ON CX':      { route: 'ticket', sos: 'Waiting on CX' },
+    'WAITING ON CX':      { route: 'ticket', sos: 'Repairing' },        // not a live status → Repairing
+    'WAITING ON PARTS':   { route: 'ticket', sos: 'Repairing' },        // → Repairing
+    'WAITING ON CUSTOMER':{ route: 'ticket', sos: 'Repairing' },        // → Repairing
     'WARRANTY':           { route: 'ticket', sos: 'Warranty' },
     'PART ORDERED':       { route: 'ticket', sos: 'Part Ordered' },
     'PART NOT ORDERED':   { route: 'ticket', sos: 'Part Not Ordered' },
@@ -238,7 +240,7 @@
     'ORDER':              { route: 'ticket', sos: 'Part Ordered' },     // alias
     'ORDERED':            { route: 'ticket', sos: 'Part Ordered' },     // alias
     'BAR':                { route: 'ticket', sos: 'Repairing' },        // best-effort
-    'ENQUIRY':            { route: 'ticket', sos: 'Enquiry' },
+    'ENQUIRY':            { route: 'skip',   sos: '' },                 // skip with a toast
     'BOOKING':            { route: 'ticket', sos: 'Booking' },
     'DEPOSIT':            { route: 'ticket', sos: 'Deposit' },
     'QUOTE':              { route: 'ticket', sos: 'Quote' },
@@ -340,6 +342,15 @@
       c.cols      = Object.assign({}, COL_DEFAULTS, c.cols || {});
       c.statusMap = Object.assign({}, STATUS_MAP_DEFAULT, c.statusMap || {});
       c.issueMap  = Object.assign({}, ISSUE_MAP_DEFAULT, c.issueMap || {});
+      // one-time migration: apply latest routing for these even over an older saved map
+      if ((c.mapRev || 0) < 2) {
+        c.statusMap['WAITING ON CX']       = { route:'ticket', sos:'Repairing' };
+        c.statusMap['WAITING ON PARTS']    = { route:'ticket', sos:'Repairing' };
+        c.statusMap['WAITING ON CUSTOMER'] = { route:'ticket', sos:'Repairing' };
+        c.statusMap['ENQUIRY']             = { route:'skip',   sos:'' };
+        c.mapRev = 2;
+        try { GM_setValue('sostk_cfg', JSON.stringify(c)); } catch {}
+      }
       return c;
     } catch { return JSON.parse(JSON.stringify(DEFAULTS)); }
   }
@@ -820,6 +831,7 @@
       let kind;
       if (route === 'sale')        kind = 'sale';
       else if (route === 'manual') kind = 'manual';
+      else if (route === 'skip')   kind = 'skip';
       else                         kind = ticket ? 'update' : 'ticket';
 
       out.push({
@@ -878,17 +890,18 @@
     update: { badge:'update', label:'Update existing tickets' },
     sale:   { badge:'sale',   label:'Sales — products' },
     note:   { badge:'note',   label:'Add note only (no ticket #)' },
+    skip:   { badge:'manual', label:'Skip on build (enquiries) — toast then next' },
     manual: { badge:'manual', label:'Not completed — skipped (refunds / notes / unparsed)' },
   };
   function renderPreview() {
-    const order = ['ticket','update','sale','note','manual'];
+    const order = ['ticket','update','sale','note','skip','manual'];
     const html = [];
     for (const kind of order) {
       const group = jobs.map((j,gi)=>({j,gi})).filter(x=>x.j.kind===kind);
       if (!group.length) continue;
       html.push(`<div class="sostk-section-h">${KIND_META[kind].label} (${group.length})</div>`);
       for (const { j, gi } of group) {
-        const badgeText = kind === 'manual' ? 'NOT DONE' : kind.toUpperCase();
+        const badgeText = kind === 'manual' ? 'NOT DONE' : kind === 'skip' ? 'SKIP' : kind.toUpperCase();
         const badge = `<span class="sostk-badge ${KIND_META[kind].badge}">${badgeText}</span>`;
         const title = esc(labelOf(j));
         const statusTag = (kind==='ticket'||kind==='update') && j.sosStatus
@@ -1029,6 +1042,7 @@
     else if (job.kind === 'update') await updateTicket(job);
     else if (job.kind === 'sale')   await buildSale(job);
     else if (job.kind === 'note')   await noteOnlyJob(job);
+    else if (job.kind === 'skip')   { showSkipBox(`${labelOf(job)} — enquiry, skipped.`); throw skipError(`${labelOf(job)} — enquiry, skipped.`); }
   }
 
   // ── Error / warning log (feeds the errors popup) ──────────────
@@ -1177,13 +1191,14 @@
   //  Needs the board/search DOM to open a ticket. Until that's wired, if it can't
   //  find the ticket it auto-skips (toast + advance) instead of freezing.
   async function updateTicket(job) {
-    const opened = await openTicketByNumber(job.ticket);
-    if (!opened) {
-      showSkipBox(`Couldn't find ticket ${job.ticket} — skipped. Update it manually.`);
-      throw skipError(`Ticket ${job.ticket} not found — auto-skipped.`);
+    const row = findTicketRow(job.ticket);
+    if (!row) {
+      showSkipBox(`Ticket ${job.ticket} isn't on the board — skipped (only board-visible tickets can be updated).`);
+      throw skipError(`Ticket ${job.ticket} not on board — auto-skipped.`);
     }
-    if (job.sosStatus) await setTicketStatus(job.sosStatus);
-    if (cfg.addNotes && job.note) await addNote(job.ticket, job.note);
+    row.scrollIntoView({ block:'center' }); await sleep(150);
+    if (job.sosStatus)            await setRowStatus(row, job.sosStatus);
+    if (cfg.addNotes && job.note) await addNoteOnRow(row, job.note);
   }
 
   // ── Add a note to an existing ticket only ─────────────────────
@@ -1628,27 +1643,61 @@
     return document.querySelector('button[title="Notes"]');
   }
 
-  // ── Open an existing ticket by number — NEEDS YOUR DOM ─────────
-  //  I don't have the board's search box / row-open markup, so this is a
-  //  stub. Paste the DOM for: (a) the ticket search input and (b) a board
-  //  row / its open button, and this gets wired the same way as the rest.
-  async function openTicketByNumber(ticketNo) {
-    // Best-effort attempt: try a generic search input + click the result.
-    const search = document.querySelector('input[placeholder*="search" i]');
-    if (search) {
-      setNativeValue(search, ticketNo);
-      await sleep(cfg.stepDelay + 300);
-      const hit = Array.from(document.querySelectorAll('td,span,a,div'))
-        .find(el => !el.children.length && el.textContent.trim() === ticketNo);
-      if (hit) {
-        const clickable = hit.closest('a,button,[role="button"],tr') || hit;
-        clickable.click();
-        await sleep(cfg.stepDelay + 300);
-        // crude confirmation: a Notes button is now reachable for this ticket
-        if (findNotesButtonFor(ticketNo)) return true;
-      }
-    }
-    return false; // caller surfaces a clear "need DOM" message
+  // ── Find a ticket's board row by its number (e.g. "A2993") ─────
+  //  Board rows carry the number in .ticket-pin-helper inside a
+  //  [data-rfd-draggable-id] row. Works for any ticket visible on the board.
+  function findTicketRow(ticketNo) {
+    const want = String(ticketNo || '').replace(/\s+/g,'').toUpperCase();
+    if (!want) return null;
+    const pin = Array.from(document.querySelectorAll('.ticket-pin-helper'))
+      .find(el => el.textContent.replace(/\s+/g,'').toUpperCase() === want);
+    if (!pin) return null;
+    return pin.closest('[data-rfd-draggable-id]') || pin.closest('.group') || pin.parentElement;
+  }
+
+  // Set status on a board row. The row's status control is the button with
+  // aria-haspopup="menu" that holds a span.truncate (the current status); the ⋮
+  // menu button has no such span. Opens on pointerdown, items are role="menuitem".
+  async function setRowStatus(row, statusText) {
+    const btn = Array.from(row.querySelectorAll('button[aria-haspopup="menu"]'))
+      .find(b => b.querySelector('span.truncate'));
+    if (!btn) { logIssue(`Status control not found on row for "${statusText}".`, 'warn'); return false; }
+    openRadix(btn);
+    const opts = await waitFor(() => {
+      const o = Array.from(document.querySelectorAll('[role="menuitem"]'))
+        .filter(e => e.offsetParent !== null && e.textContent.trim());
+      return o.length ? o : null;
+    }, 2500);
+    if (!opts) { logIssue(`Status menu didn't open for "${statusText}".`, 'warn'); return false; }
+    const want = statusText.trim().toLowerCase();
+    const hit = opts.find(o => o.textContent.trim().toLowerCase() === want) ||
+                opts.find(o => o.textContent.trim().toLowerCase().includes(want));
+    if (hit) { hit.click(); await sleep(cfg.stepDelay); return true; }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
+    const names = opts.map(o => o.textContent.trim()).join(', ');
+    logIssue(`Status "${statusText}" not applied — not in SOS list. Options: ${names}`, 'warn');
+    return false;
+  }
+
+  // Add a note via the row's Notes button → dialog → textarea → Add Note.
+  async function addNoteOnRow(row, text) {
+    if (!text) return;
+    const nb = row.querySelector('button[title="Notes"]');
+    if (!nb) { logIssue('Notes button not found on row.', 'warn'); return; }
+    nb.click();
+    const dlg = await waitFor(() => Array.from(document.querySelectorAll('[role="dialog"]'))
+      .find(d => { const h = d.querySelector('h2'); return (h && /notes/i.test(h.textContent)) || d.querySelector('textarea'); }), 4000);
+    if (!dlg) { logIssue('Notes dialog did not open.', 'warn'); return; }
+    await sleep(200);
+    const ta = dlg.querySelector('textarea[placeholder*="note" i]') || dlg.querySelector('textarea');
+    if (!ta) { logIssue('Note textarea not found.', 'warn'); return; }
+    setNativeValue(ta, text); await sleep(160);
+    const add = Array.from(dlg.querySelectorAll('button')).find(b => /add note/i.test(b.textContent));
+    if (add) { let t=0; while (add.disabled && t<14) { await sleep(140); t++; } if (!add.disabled) { add.click(); await sleep(cfg.stepDelay + 200); } }
+    const close = dlg.querySelector('button .lucide-x')?.closest('button') ||
+                  Array.from(dlg.querySelectorAll('button')).find(b => /close/i.test(b.textContent));
+    if (close) { close.click(); await sleep(180); }
+    else { document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })); await sleep(150); }
   }
 
   // ═════════════════════════════════════════════════════════════
