@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.6';
+  const SCRIPT_VERSION = '2.7';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -1242,8 +1242,11 @@
   // ── Build a quick product sale (walk-in) — reuses Sale tab ────
   async function buildSale(job) {
     await clickTab('Sale');
-    const w = findWalkInButton();
-    if (!w) throw new Error('Walk-in button not found on Sale tab');
+    // The Sale panel only mounts its content once the tab is active, so wait for the
+    // Walk-in button to appear rather than querying immediately. Its presence also
+    // confirms the tab actually switched (it lives only on the Sale tab).
+    const w = await waitFor(() => findWalkInButton(), 3000);
+    if (!w) throw new Error('Walk-in button not found — Sale tab did not switch/mount');
     w.click(); await sleep(cfg.stepDelay + 150);
 
     const descs  = lineInputs('Item description'), prices = lineInputs('0.00');
@@ -1843,18 +1846,24 @@
     return tabs.find(t => (t.id || '').toLowerCase().endsWith('trigger-' + want))
         || tabs.find(t => t.textContent.trim().toLowerCase().includes(want));
   }
-  // Reliable radix Tab activation: pointer + mouse + click + focus, then verify.
+  // Reliable radix Tab activation: retry pointer + mouse + focus + click until the
+  // tab actually reports active. Radix Tabs use automatic activation (focus selects),
+  // but a single click can land before the trigger is focusable — so verify + retry.
   async function clickTab(label) {
-    const tab = findTab(label);
+    const isActive = t => !!t && (t.getAttribute('data-state') === 'active' || t.getAttribute('aria-selected') === 'true');
+    let tab = findTab(label);
     if (!tab) throw new Error(`"${label}" tab not found`);
-    if (tab.getAttribute('data-state') === 'active' || tab.getAttribute('aria-selected') === 'true') return true;
-    try { tab.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); } catch {}
-    tab.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-    tab.click();
-    try { tab.focus(); } catch {}
-    await waitFor(() => tab.getAttribute('data-state') === 'active' || tab.getAttribute('aria-selected') === 'true', 1500);
-    await sleep(cfg.stepDelay);
-    return true;
+    if (isActive(tab)) return true;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      tab = findTab(label) || tab;
+      try { tab.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); } catch {}
+      tab.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      try { tab.focus(); } catch {}                 // radix automatic mode activates on focus
+      tab.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      tab.click();
+      if (await waitFor(() => isActive(findTab(label)), 1200)) { await sleep(cfg.stepDelay); return true; }
+    }
+    throw new Error(`Could not switch to the "${label}" tab`);
   }
   function findWalkInButton() { return document.querySelector('button[title*="Walk-in" i]') || Array.from(document.querySelectorAll('button')).find(b=>/walk[\s-]?in/i.test(b.getAttribute('title')||b.textContent||'')); }
   function findAddCustomerButton() { return Array.from(document.querySelectorAll('button')).find(b=>b.querySelector('svg.lucide-user-plus')); }
