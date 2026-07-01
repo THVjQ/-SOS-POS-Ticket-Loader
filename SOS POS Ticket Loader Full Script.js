@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,7 +23,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.7';
+  const SCRIPT_VERSION = '2.8';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — lifted verbatim from your Sales Loader v2.8 so device /
@@ -546,7 +546,7 @@
         <button class="sostk-btn sostk-btn-success sostk-btn-sm" id="sostk-push-btn" style="flex:1">⬆ Push to Sheet</button>
         <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-results-clear">Clear</button>
       </div>
-      <p class="sostk-note" style="margin-top:8px">Ticket #s are <b>editable</b> — fix any before copying. <b>Copy</b> outputs ticket numbers only (one per line).</p>
+      <p class="sostk-note" style="margin-top:8px">Rows stay in <b>paste order</b>. Ticket #s are <b>editable</b> — fix any before copying. <b>Copy</b> outputs ticket numbers only (one per line).</p>
     </div>
 
     <!-- SETTINGS -->
@@ -822,9 +822,11 @@
         else                                        route = 'manual';
       }
 
-      // Walk-in = no customer name AND no existing ticket # → always a Sale, never a
-      // repair ticket. (Named customers / existing tickets keep their route.)
-      const hasName = !!(r.name && r.name.trim() && !/^\(?no name\)?$/i.test(r.name.trim()));
+      // Walk-in = no real customer name AND no existing ticket # → always a Sale,
+      // never a repair ticket. The parser labels bare walk-in rows 'Walk-in', so we
+      // must treat that literal (and its spelling variants) as "no name" here — the
+      // old check only excluded "(no name)", which let walk-ins slip through as tickets.
+      const hasName = !!(r.name && r.name.trim() && !/^\(?\s*(no name|walk[\s-]*in)\s*\)?$/i.test(r.name.trim()));
       if (!ticket && !hasName && route === 'ticket') route = 'sale';
 
       // Quote + needs-popup flag depend on route.
@@ -1759,7 +1761,9 @@
     captured.add(i);
     const job = jobs[i];
     const name = job.customer ? job.customer.name : 'Walk-in';
-    results.push({ ticket: job.ticket || latestTicket() || '', name, kind: job.kind, note: job.note || '', status: job.sosStatus || '' });
+    // pasteIndex = the job's original row index, so Results + Copy can always render
+    // in the exact paste order regardless of build / skip / retry sequence.
+    results.push({ pasteIndex: i, ticket: job.ticket || latestTicket() || '', name, kind: job.kind, note: job.note || '', status: job.sosStatus || '' });
     renderResults();
   }
   function latestTicket() {
@@ -1774,6 +1778,12 @@
     arr.sort((a,b) => b.n-a.n);
     return arr[0].t;
   }
+  // Results sorted back into paste order (by pasteIndex), paired with their real
+  // index in `results` so the editable inputs still write to the right entry.
+  function orderedResults() {
+    return results.map((r,i)=>({ r, i }))
+      .sort((a,b)=> ((a.r.pasteIndex ?? a.i) - (b.r.pasteIndex ?? b.i)));
+  }
   function renderResults() {
     const body=document.getElementById('sostk-results-body');
     const table=document.getElementById('sostk-results-table');
@@ -1781,14 +1791,16 @@
     const actions=document.getElementById('sostk-results-actions');
     if (!results.length) { table.style.display='none'; actions.style.display='none'; empty.style.display='block'; return; }
     empty.style.display='none'; table.style.display='table'; actions.style.display='flex';
-    body.innerHTML = results.map((r,i) => `
+    body.innerHTML = orderedResults().map(({ r, i }) => `
       <tr><td><input data-i="${i}" value="${esc(r.ticket)}" placeholder="A####"></td>
       <td class="sostk-res-name">${esc(r.name)}</td>
       <td style="font-size:10px;color:#64748b">${esc(r.kind)}</td></tr>`).join('');
     body.querySelectorAll('input').forEach(inp => inp.addEventListener('input', () => { results[Number(inp.dataset.i)].ticket = inp.value; }));
   }
   document.getElementById('sostk-copy-btn').addEventListener('click', () => {
-    const tsv = results.map(r=>r.ticket).join('\n');
+    // Copy ticket numbers in paste order (one per line) so they drop straight back
+    // into the sheet in the same row order you pasted from.
+    const tsv = orderedResults().map(({ r }) => r.ticket).join('\n');
     navigator.clipboard.writeText(tsv).then(
       () => { const b=document.getElementById('sostk-copy-btn'); const o=b.textContent; b.textContent='✓ Copied!'; setTimeout(()=>b.textContent=o,1500); },
       () => alert('Copy failed:\n\n'+tsv)
@@ -1803,7 +1815,8 @@
   // isn't bound by same-origin so the cross-site POST goes through.
   function pushToSheet(isAuto) {
     if (!cfg.webAppUrl) { setStatus('⚠️ Set the Apps Script Web App URL in Settings first.'); return; }
-    const rows = results
+    const rows = orderedResults()
+      .map(({ r }) => r)
       .filter(r => r.ticket && r.note)
       .map(r => ({ key: r.note, ticket: r.ticket, name: r.name, status: r.status }));
     if (!rows.length) { setStatus('Nothing to push — need a ticket # and the matching note.'); return; }
