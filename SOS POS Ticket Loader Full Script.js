@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.9
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -23,11 +23,15 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.8';
+  const SCRIPT_VERSION = '2.9';
 
   // ═════════════════════════════════════════════════════════════
-  // Parser — lifted verbatim from your Sales Loader v2.8 so device /
-  // job / name / phone extraction behaves identically across both tools.
+  // Parser — device / job / name / phone extraction. v2.9 hardens the
+  // multi-repair handling (reads every "+ / , / and / ="-joined clause,
+  // not just the first), ignores accessory add-ons (cam/lens protector,
+  // screen protectors) as repairs, drops "X damaged, dont fix" items,
+  // and maps a lot more shop shorthand (EPS, prox flex, board repair,
+  // charge coil, HDMI, volume button, scam/adware/bank clean, etc).
   // ═════════════════════════════════════════════════════════════
   const Parser = (() => {
     function findPhone(text) {
@@ -55,7 +59,7 @@
     const EMAIL_RE = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
     const firstEmail = t => { const m = t.match(EMAIL_RE); return m ? m[0].toLowerCase() : ''; };
 
-    const TIER  = '(pro max|pro|plus|max|mini|ultra|fe|\\+)';
+    const TIER  = '(pro max|pro|plus|air|max|mini|ultra|fe|\\+)';
     const cap   = s => s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : '';
     const upper = s => s ? s.toUpperCase().replace(/\s+/g,' ').trim() : '';
     function tierSuffix(t) {
@@ -73,7 +77,7 @@
       { re: /\bmacbook\s*(pro|air)?\s*(a\d{4})?/i,
         fmt: m => 'MacBook'+(m[1]?' '+cap(m[1]):'')+( m[2]?' '+m[2].toUpperCase():'') },
       { re: /\bipod\b/i, fmt: () => 'iPod' },
-      { re: new RegExp('\\biphone\\s*(\\d{1,2}s?|xs max|xs|xr|x|se\\s*\\d?|se)\\s*'+TIER+'?','i'),
+      { re: new RegExp('\\biphone\\s*(\\d{1,2}s?e?|xs max|xs|xr|x|se\\s*\\d?|se)\\s*'+TIER+'?','i'),
         fmt: m => 'iPhone '+upper(m[1])+tierSuffix(m[2]) },
       { re: /\b(?:samsung\s+)?(?:galaxy\s+)?(s|note|tab)\s*(\d{1,3}[a-z]?)\s*(ultra|plus|fe|\+|pro)?/i,
         fmt: m => 'Galaxy '+m[1].toUpperCase()+m[2].toUpperCase()+tierSuffix(m[3]) },
@@ -102,37 +106,55 @@
       return best || { device: '', index: -1 };
     }
 
+    // Repair label patterns. Order is specific → general; detectJobsIn collects
+    // every match in a clause then resolves overlaps by position/length.
     const JOBS = [
-      [/charging?\s*port\s*clean|c\/?p\s*clean|port\s*clean/i,       'Charging Port Clean'],
-      [/charging?\s*port|charge\s*port|c\/?p\b/i,                    'Charging Port'],
-      [/not\s*charging|won'?t\s*charge|wont\s*charge|no\s*charge|charging\s*(?:issue|problem|fault)/i, 'Charging Issues'],
+      [/charging?\s*port\s*clean|c\/?p\s*clean|port\s*clean|clean(?:ed|\s*out)?\s*(?:the\s*)?(?:charge|charging)\s*port/i, 'Charging Port Clean'],
+      [/charging?\s*port|charge\s*port|\bc\/p\b/i,                    'Charging Port'],
+      [/not\s*charging|won'?t\s*charge|wont\s*charge|no\s*charge|charging\s*(?:issue|problem|fault)|moisture\s*in\s*(?:the\s*)?(?:charge|charging)?\s*port/i, 'Charging Issues'],
+      [/charg\w*\s*coil|charge\s*coild/i,                             'Charge Coil'],
       [/rear\s*housing/i,                                             'Rear Housing'],
-      [/rear\s*glass|back\s*glass|b\/?g\b/i,                         'Rear Glass'],
-      [/camera\s*glass|cam\s*glass|cam(?:era)?\s*lens|lens\s*protector/i, 'Camera Glass'],
-      [/front\s*cam(?:era)?|selfie\s*cam(?:era)?/i,                  'Front Camera'],
-      [/\bcamera\b|\bcam\b/i,                                         'Camera'],
+      [/\bhousing\b/i,                                                'Housing'],
+      [/\bframe\b/i,                                                  'Frame'],
+      [/rear\s*glass|back\s*glass|\bb\/?g\b/i,                        'Rear Glass'],
+      [/(?:rear\s*)?cam(?:era)?\s*glass|cam(?:era)?\s*lens(?!\s*protect)/i, 'Camera Glass'],
+      [/front\s*cam(?:era)?|selfie\s*cam(?:era)?|\bffc\b/i,          'Front Camera'],
+      [/camera\s*module|\bcam(?:era)?\b(?!\s*(?:glass|lens|protect|t\/g|module))/i, 'Camera'],
       [/face\s*id|faceid/i,                                           'Face ID'],
-      [/no\s*power|won'?t\s*(?:turn\s*on|power)|wont\s*(?:turn\s*on|power)|not\s*turning\s*on|no\s*boot/i, 'No Power'],
-      [/housing|frame/i,                                              'Housing'],
-      [/\boled\b/i,                                                   'OLED'],
+      [/\bprox(?:imity)?(?:\s*(?:sensor|flex))?/i,                    'Prox Sensor'],
+      [/board\s*(?:level|repair|issue)|\bblr\b|micro\s*solder\w*|microsoldering/i, 'Board Repair'],
+      [/\bhdmi\b/i,                                                   'HDMI Port'],
+      [/no\s*power|won'?t\s*(?:turn\s*on|power)|wont\s*(?:turn\s*on|power)|not\s*turning\s*on|no\s*boot|won'?t\s*boot/i, 'No Power'],
+      [/\boled\b|soft\s*oled/i,                                       'OLED'],
       [/\blcd\b/i,                                                    'LCD'],
       [/\bdigi(?:tizer)?\b/i,                                         'Digitizer'],
       [/\bscreen\b|\bscre+ne?\b|\bsceen\b|screne/i,                  'Screen'],
-      [/amp\s*battery|battery\s*amp|\bbattery\b|\bbatt\b/i,          'Battery'],
-      [/data\s*transfer/i,                                            'Data Transfer'],
+      [/amp\s*battery|battery\s*amp|swollen\s*batt\w*|swelling\s*batt\w*|\bbattery\b|\bbatt\b/i, 'Battery'],
+      [/data\s*transfer|data\s*tranfer/i,                             'Data Transfer'],
       [/data\s*recover(?:y|ed)?/i,                                    'Data Recovery'],
-      [/virus\s*clean|scam\s*clean|\bvirus\b|\bscam\b/i,             'Virus Clean'],
-      [/factory\s*reset|\brestore\b/i,                                'Restore'],
-      [/ear\s*piece|earpiece|\bspeaker\b/i,                           'Speaker'],
+      [/virus\s*clean|scam\s*clean|adware\s*clean|bank\s*(?:clean|report)|malware|\bvirus\b|\bscam\b|\badware\b/i, 'Virus Clean'],
+      [/factory\s*rese?t|factory\s*restore|\brestore\b/i,             'Restore'],
+      [/insurance\s*report/i,                                         'Insurance Report'],
+      [/ear\s*piece|earpiece|ear\s*speaker|\beps\b|loud\s*speaker|loudspeaker|\bspeaker\b/i, 'Speaker'],
       [/power\s*button/i,                                             'Power Button'],
+      [/volume\s*button/i,                                            'Volume Button'],
       [/sim\s*tray/i,                                                 'Sim Tray'],
       [/signal\s*flex/i,                                              'Signal Flex'],
       [/microphone|\bmic\b/i,                                         'Microphone'],
       [/diagnos\w*|\bdiag\b/i,                                        'Diagnose'],
+      [/\bsoftware\b/i,                                               'Software'],
       [/\bwd\b|water\s*damaged?|liquid\s*damaged?/i,                  'Water Damage'],
     ];
 
-    const NARRATIVE_CUTOFFS = /\b(call:|pin:|imei|cx\b|customer|opened? (?:the )?device|testing ok|tried|warned|quoted|happy to|will (?:be|drop|call|pick)|came (?:back|in)|did ?n.?t|was ?n.?t|does ?n.?t|is ?n.?t|no image|no touch|glitch|liquid damage indicators|no notes|paid|deposit|apple id|password|passcode|aware it)\b/i;
+    // Prose / outcome / customer markers. Once one appears the note has moved from
+    // "what to do" to narrative, so we stop reading repairs there. Deliberately
+    // excludes symptom words (no power, not charging, water damage) — those ARE
+    // the stated issue and must still be detectable.
+    const NARRATIVE_CUTOFFS = /\b(call:|pin:?\b|imei\b|\bcx\b|customer\b|opened?\s+(?:up|the|device)|test(?:ing|ed)\b|tried\b|reseat\w*|reglu\w*|refit\w*|dried\b|order(?:ed|ing)\b|sent\b|posted\b|quoted\b|offered\b|recommend\w*|advised\b|warned\b|happy\b|will\s+(?:be|call|drop|pick|collect|get|try|test|order|need|have|pay)|came\s+(?:back|in)|returned\b|dropped\s+(?:it|in|off|back)|picke?d?\s*up\b|collected\b|paid\b|deposit\b|aware\b|no\s*notes\b|apple\s*id\b|password\b|passcode\b|voids?\b|no\s*warranty\b|warranty\b|\bwty\b|in\s*cp\s*cart\b|on\s*charge\b|in\s*clamps\b|does\s?n['’]?t|did\s?n['’]?t|was\s?n['’]?t|is\s?n['’]?t|liquid\s*damage\s*indicators)\b/i;
+
+    // Clause says NOT to do something → don't turn it (or the item it refers to)
+    // into an issue. Catches "dont fix", "no fix", "do not repair", "dont go ahead".
+    const NO_DO = /(?:don'?t|do not|no|not)\s*(?:fix|repair|go\s*ahead)/i;
 
     function detectJobsIn(segment) {
       const raw = [];
@@ -153,16 +175,35 @@
       return accepted.filter(j => seen.has(j.label) ? false : seen.add(j.label)).map(j => j.label);
     }
 
+    // Read every repair in a line, not just the first clause.
     function detectJobs(body) {
       const cut  = body.search(NARRATIVE_CUTOFFS);
-      let head   = (cut > 0 ? body.slice(0,cut) : body).replace(/\s+and\s+/gi,' + ');
-      const primary = head.split(',')[0];
-      let jobs = detectJobsIn(primary);
-      if (!jobs.length) jobs = detectJobsIn(body);
-      if (jobs.length > 1) jobs = jobs.filter(j => j !== 'Water Damage');
-      if ((jobs.includes('OLED') || jobs.includes('LCD')) && jobs.includes('Screen'))
-        jobs = jobs.filter(j => j !== 'Screen');
-      return jobs;
+      let head   = (cut > 0 ? body.slice(0, cut) : body)
+                     .replace(/\s+(?:and|&)\s+/gi, ' + ')   // "screen and battery"
+                     .replace(/\s*=\s*/g, ' + ');            // "$X = $Y" totals
+
+      // Split into clauses on + , ; and spaced field-dashes.
+      const clauses = head.split(/\s*\+\s*|\s*,\s*|\s*;\s*|\s+-\s+/)
+                          .map(s => s.trim()).filter(Boolean);
+
+      // Flag "dont fix X" clauses (and the item they point back to) to skip.
+      const skip = new Set();
+      clauses.forEach((cl, i) => {
+        if (NO_DO.test(cl)) { skip.add(i); if (i > 0) skip.add(i - 1); }
+      });
+
+      const jobs = [], seen = new Set();
+      clauses.forEach((cl, i) => {
+        if (skip.has(i)) return;
+        for (const label of detectJobsIn(cl))
+          if (!seen.has(label)) { seen.add(label); jobs.push(label); }
+      });
+
+      let out = jobs.length ? jobs : detectJobsIn(body);   // fallback: whole body
+      if (out.length > 1) out = out.filter(j => j !== 'Water Damage');
+      if ((out.includes('OLED') || out.includes('LCD')) && out.includes('Screen'))
+        out = out.filter(j => j !== 'Screen');
+      return out;
     }
 
     const NAME_JUNK = /\b(call|text only|text|mob|ph|phone|cx|walkin|walk-in)\b[:.]?/gi;
@@ -187,7 +228,11 @@
       const email = firstEmail(line);
 
       let body = line.replace(/^\s*walk\s*-?in\b[\s:-]*/i,' ');
-      if (name && name !== 'Walk-in') body = body.replace(name,' ');
+      // Only strip the "name" out of the body when it's a genuine customer name —
+      // not when detectName has grabbed device/repair text (which happens when the
+      // description cell has no "Name -" prefix, e.g. "iPhone XS LCD + Battery").
+      if (name && name !== 'Walk-in' && !detectDevice(name).device && !detectJobs(name).length)
+        body = body.replace(name,' ');
       body = body
         .replace(/(?:\+?61[\s-]?|0)?\d(?:[\s-]?\d){6,11}/g,' ')
         .replace(EMAIL_RE,' ')
@@ -294,6 +339,7 @@
     'Charging Port':       'Charging Port',
     'Charging Port Clean': 'Charging Port',
     'Charging Issues':     'Charging Issues',
+    'Charge Coil':         'Charging Issues',
     'Back Glass':          'Back Glass',
     'Rear Glass':          'Back Glass',
     'Rear Housing':        'Housing / Cosmetic',
@@ -310,10 +356,16 @@
     'Data Recovery':       'Data Recovery',
     'Virus Clean':         'Virus Removal',
     'Restore':             'Software / Update',
+    'Software':            'Software / Update',
     'Software / Update':   'Software / Update',
     'Speaker':             'Speaker',
     'Water Damage':        'Water Damage',
+    'Board Repair':        'Other',
+    'Prox Sensor':         'Other',
+    'HDMI Port':           'Other',
+    'Insurance Report':    'Other',
     'Power Button':        'Other',
+    'Volume Button':       'Other',
     'Sim Tray':            'Other',
     'Signal Flex':         'Other',
     'Microphone':          'Other',
@@ -349,6 +401,14 @@
         c.statusMap['WAITING ON CUSTOMER'] = { route:'ticket', sos:'Repairing' };
         c.statusMap['ENQUIRY']             = { route:'skip',   sos:'' };
         c.mapRev = 2;
+        try { GM_setValue('sostk_cfg', JSON.stringify(c)); } catch {}
+      }
+      // v2.9: fold the new issue-label rows into any older saved issue map so the
+      // new parser labels (Frame, Charge Coil, Board Repair, Prox Sensor, HDMI Port,
+      // Volume Button, Insurance Report, Software) resolve without a manual reset.
+      if ((c.mapRev || 0) < 3) {
+        c.issueMap = Object.assign({}, ISSUE_MAP_DEFAULT, c.issueMap);
+        c.mapRev = 3;
         try { GM_setValue('sostk_cfg', JSON.stringify(c)); } catch {}
       }
       return c;
