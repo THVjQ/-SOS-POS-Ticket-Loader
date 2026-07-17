@@ -1,3 +1,4 @@
+// SOS
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
