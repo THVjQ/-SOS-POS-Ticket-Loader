@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.9
-// @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), or build a product Sale. Refunds & notes are skipped and flagged Not completed. Quote reads from col L. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
+// @version      3.0
+// @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), build a product Sale, or move a Refurb to the board (rows with a stock #123). Quote reads from col L; a Paid/Collected status takes payment from the cash (E) + card (F) columns. Refunds & notes are skipped and flagged Not completed. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -24,7 +24,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.9';
+  const SCRIPT_VERSION = '3.0';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — device / job / name / phone extraction. v2.9 hardens the
@@ -511,12 +511,14 @@
     .sostk-job.skipped { opacity: .5; border-color: #475569; }
     .sostk-job.skipped .sostk-job-name { text-decoration: line-through; }
     .sostk-job.update { background: #0c1a26; border-color: #0e7490; }
+    .sostk-job.refurb { background: #08130c; border-color: #15803d; }
     .sostk-job.manual { background: #160d1f; border-color: #6d28d9; }
     .sostk-job-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
     .sostk-badge { border-radius: 6px; padding: 1px 7px; font-size: 10px; font-weight: 800; }
     .sostk-badge.ticket { background: #312e81; color: #c7d2fe; }
     .sostk-badge.sale   { background: #134e4a; color: #5eead4; }
     .sostk-badge.update { background: #155e75; color: #a5f3fc; }
+    .sostk-badge.refurb { background: #14532d; color: #86efac; }
     .sostk-badge.note   { background: #422006; color: #fdba74; }
     .sostk-badge.manual { background: #4c1d95; color: #c4b5fd; }
     .sostk-job-name { font-size: 12.5px; font-weight: 700; color: #e2e8f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -700,8 +702,10 @@
         <b>route</b> values: <b>ticket</b> (create repair) · <b>sale</b> (product) · <b>manual</b> (skip → Not completed).<br>
         <b>sos</b> must match your real Status dropdown text (form default is "Repairing").<br>
         Rows with a ticket # already in col C become an <b>Update</b> (set status + add note, no new ticket).<br>
+        Rows with a stock <b>#123</b> in the description become a <b>Refurb</b>: I search that number, ask you to confirm the item, then Move to Board. Add-ons (<b>+ case $40</b>) are flagged for the cart.<br>
         <b>Refunds & notes</b> are skipped and listed under <b>Not completed</b> for you to handle.<br>
         <b>Columns:</b> C = existing ticket# · D = status · E = cash · F = eftpos · L = quote (a number is used; the word “quote” prompts you) · description = col after PIN.<br>
+        <b>Paid / Collected</b> status → I process the payment from the cash (E) + card (F) columns after the ticket/refurb hits the board.<br>
         <b>Write-back:</b> set the Web App URL above, then use <b>⬆ Push to Sheet</b> in Results (or pick Auto). It matches each row by its description and writes the ticket # into col C.
       </p>
     </div>
@@ -874,6 +878,28 @@
       const r = cfg.useNoteParser ? Parser.parseNote(desc)
                                   : { name:'', phone:'X', email:'', item:desc, device:'', jobs:[] };
 
+      // Refurb rows carry a stock reference like "#700" (the SKU / stock number).
+      // Its presence routes the row to the Refurb tab: we search that number in SOS's
+      // refurb catalogue, confirm the match, then Move to Board. Any "+ item $x" add-ons
+      // (e.g. "+ case $40") and a trailing "= $total" are captured so the accessories
+      // and total can be reconciled on the board.
+      const skuM      = desc.match(/#\s*(\d{3,})/);
+      const isRefurb  = !!skuM;
+      const refurbSku = isRefurb ? skuM[1] : '';
+      const refurbExtras = [];
+      let   refurbTotal  = 0;
+      if (isRefurb) {
+        const eqM = desc.match(/=\s*\$?\s*([\d,]+(?:\.\d+)?)/);
+        if (eqM) refurbTotal = num(eqM[1]);
+        desc.split('+').slice(1).forEach(seg => {
+          const pm = seg.match(/\$\s*([\d,]+(?:\.\d+)?)/);
+          if (!pm) return;
+          const label = seg.replace(/\$\s*[\d,]+(?:\.\d+)?/,'').replace(/=.*/,'')
+                           .replace(/#\s*\d+/,'').replace(/[-–—]/g,' ').replace(/\s+/g,' ').trim();
+          refurbExtras.push({ label: label || 'item', price: num(pm[1]) });
+        });
+      }
+
       // Decide route. Status map wins; fall back to content.
       let route = si.route;
       if (route === 'note') route = 'manual';   // notes are skipped → Not completed
@@ -890,27 +916,32 @@
       const hasName = !!(r.name && r.name.trim() && !/^\(?\s*(no name|walk[\s-]*in)\s*\)?$/i.test(r.name.trim()));
       if (!ticket && !hasName && route === 'ticket') route = 'sale';
 
+      if (isRefurb) route = 'refurb';   // a stock # always means a refurb — overrides the above
+
       // Quote + needs-popup flag depend on route.
       let quote = 0, needsQuote = false;
       if (route === 'sale')        quote = payNum || qNum;
       else if (route === 'ticket') { quote = qNum; needsQuote = qIsWord; }
+      else if (route === 'refurb') quote = refurbTotal || payNum || qNum;
 
       // Existing ticket (col C) + ticket route = update, not create.
       let kind;
-      if (route === 'sale')        kind = 'sale';
+      if (route === 'refurb')      kind = 'refurb';
+      else if (route === 'sale')   kind = 'sale';
       else if (route === 'manual') kind = 'manual';
       else if (route === 'skip')   kind = 'skip';
       else                         kind = ticket ? 'update' : 'ticket';
 
       out.push({
-        kind,                      // ticket | sale | update | note | manual
+        kind,                      // ticket | sale | update | refurb | note | manual
         route, ticket,
         statusCode: si.code, sosStatus: si.sos,
-        customer: { name: r.name || (kind==='sale'?'Walk-in':'(no name)'), phone: r.phone || 'X', email: r.email || '' },
-        device: r.device || '',
-        jobs:   (r.jobs && r.jobs.length) ? r.jobs : [],
-        item:   r.item || desc,
+        customer: { name: r.name || (kind==='sale'||kind==='refurb'?'Walk-in':'(no name)'), phone: r.phone || 'X', email: r.email || '' },
+        device: kind==='refurb' ? '' : (r.device || ''),
+        jobs:   kind==='refurb' ? [] : ((r.jobs && r.jobs.length) ? r.jobs : []),
+        item:   kind==='refurb' ? ('#'+refurbSku+(r.device?' '+r.device:'')) : (r.item || desc),
         quote, needsQuote, cashAmt, eftAmt,
+        refurbSku, refurbExtras,   // stock # to search, and "+ item $x" add-ons to reconcile
         note:   desc,             // full original line goes into the Notes dialog
         status: 'pending',
       });
@@ -924,7 +955,7 @@
       dropZone.classList.add('has-data');
       document.getElementById('sostk-paste-summary').style.display = 'flex';
       document.getElementById('sostk-count-badge').textContent = jobs.length;
-      const counts = ['ticket','update','sale','note','manual']
+      const counts = ['ticket','update','sale','refurb','note','manual']
         .map(k => { const n = jobs.filter(j=>j.kind===k).length; return n && `${n} ${k}`; })
         .filter(Boolean).join(' · ');
       document.getElementById('sostk-count-label').textContent = counts;
@@ -946,6 +977,7 @@
   function labelOf(job) {
     if (!job) return '';
     if (job.kind === 'sale')   return job.customer.name || 'Walk-in';
+    if (job.kind === 'refurb') return (job.customer.name && job.customer.name !== '(no name)' ? job.customer.name + ' · ' : '') + '#' + (job.refurbSku || '?');
     if (job.kind === 'update') return job.ticket + ' · ' + (job.customer.name||'');
     return job.customer.name || job.item;
   }
@@ -957,12 +989,13 @@
     ticket: { badge:'ticket', label:'New tickets — repairs' },
     update: { badge:'update', label:'Update existing tickets' },
     sale:   { badge:'sale',   label:'Sales — products' },
+    refurb: { badge:'refurb', label:'Refurbs — search stock # → move to board' },
     note:   { badge:'note',   label:'Add note only (no ticket #)' },
     skip:   { badge:'manual', label:'Skip on build (enquiries) — toast then next' },
     manual: { badge:'manual', label:'Not completed — skipped (refunds / notes / unparsed)' },
   };
   function renderPreview() {
-    const order = ['ticket','update','sale','note','skip','manual'];
+    const order = ['ticket','update','sale','refurb','note','skip','manual'];
     const html = [];
     for (const kind of order) {
       const group = jobs.map((j,gi)=>({j,gi})).filter(x=>x.j.kind===kind);
@@ -972,7 +1005,7 @@
         const badgeText = kind === 'manual' ? 'NOT DONE' : kind === 'skip' ? 'SKIP' : kind.toUpperCase();
         const badge = `<span class="sostk-badge ${KIND_META[kind].badge}">${badgeText}</span>`;
         const title = esc(labelOf(j));
-        const statusTag = (kind==='ticket'||kind==='update') && j.sosStatus
+        const statusTag = (kind==='ticket'||kind==='update'||kind==='refurb') && j.sosStatus
           ? `<span class="sostk-job-status">→ ${esc(j.sosStatus)}</span>` : '';
         const sub = (j.customer.phone && j.customer.phone!=='X')
           ? `<div class="sostk-job-sub">☎ ${esc(j.customer.phone)}${j.customer.email?' · ✉ '+esc(j.customer.email):''}</div>` : '';
@@ -984,7 +1017,7 @@
           : '';
         const noteRow = cfg.addNotes && j.note ? `<div class="sostk-note-row" title="${esc(j.note)}">📝 ${esc(j.note.slice(0,90))}${j.note.length>90?'…':''}</div>` : '';
         html.push(`
-          <div class="sostk-job ${j.status==='done'?'done':(kind==='update'?'update':kind==='manual'?'manual':'')}" id="sostk-job-${gi}">
+          <div class="sostk-job ${j.status==='done'?'done':(kind==='update'?'update':kind==='manual'?'manual':kind==='refurb'?'refurb':'')}" id="sostk-job-${gi}">
             <div class="sostk-job-head">${badge}<span class="sostk-job-name">${title}</span>${statusTag}</div>
             ${sub}${dev}${quoteEdit}${noteRow}
           </div>`);
@@ -1109,6 +1142,7 @@
     if (job.kind === 'ticket')      await buildTicket(job);
     else if (job.kind === 'update') await updateTicket(job);
     else if (job.kind === 'sale')   await buildSale(job);
+    else if (job.kind === 'refurb') await buildRefurb(job);
     else if (job.kind === 'note')   await noteOnlyJob(job);
     else if (job.kind === 'skip')   { showSkipBox(`${labelOf(job)} — enquiry, skipped.`); throw skipError(`${labelOf(job)} — enquiry, skipped.`); }
   }
@@ -1335,6 +1369,201 @@
       return;
     }
     await payForSale(job, dialog);
+  }
+
+  // ── Build a refurb: search the stock #, confirm, Move to Board ─
+  //  Flow: Refurb tab → customer (Move to Board stays locked until one is chosen) →
+  //  search the row's #SKU in the refurb catalogue → confirm the match (or pick
+  //  manually) → Move to Board → note. Accessories ("+ case $40") can't be added
+  //  through the catalogue search, so they're flagged for manual entry via the cart.
+  async function buildRefurb(job) {
+    await clickTab('Refurb');
+    // The Refurb panel mounts its content once active; wait for the item selector.
+    const itemBtn = await waitFor(() => findRefurbItemButton(), 3000);
+    if (!itemBtn) throw new Error('Refurb Item selector not found — Refurb tab did not switch/mount');
+
+    // Customer first — "Move to Board" is disabled until a customer is selected.
+    const hasName = !!(job.customer && job.customer.name &&
+      !/^\(?\s*(no name|walk[\s-]*in)\s*\)?$/i.test(job.customer.name.trim()));
+    if (hasName) {
+      await createCustomer(job.customer);
+    } else {
+      const w = await waitFor(() => findWalkInButton(), 2000);
+      if (w) { w.click(); await sleep(cfg.stepDelay); }
+      else logIssue('Walk-in button not found on Refurb tab — select a customer manually.', 'warn');
+    }
+
+    // Pick the refurb item by its stock number.
+    const chosen = await selectRefurbItem(job);
+    if (!chosen) {
+      showSkipBox(`No refurb item chosen for ${labelOf(job)} — row skipped.`);
+      throw skipError('No refurb item chosen — row skipped.');
+    }
+
+    // Move to Board.
+    const moveBtn = await waitFor(() => findMoveToBoardButton(), 3000);
+    if (!moveBtn) throw new Error('Move to Board button not found');
+    let t = 0; while (moveBtn.disabled && t < 20) { await sleep(150); t++; }
+    if (moveBtn.disabled) throw new Error('Move to Board stayed disabled — needs a customer + refurb item. Left open.');
+    moveBtn.click();
+    await sleep(cfg.stepDelay + 400);
+    job.ticket = latestTicket() || job.ticket;
+
+    // Accessories to reach the total (e.g. "+ case $40") — the cart isn't wired here,
+    // so flag them for manual entry. The full breakdown is also in the note.
+    if (job.refurbExtras && job.refurbExtras.length) {
+      const list = job.refurbExtras.map(x => x.label + (x.price ? ` $${x.price}` : '')).join(', ');
+      showSkipBox(`Refurb on board — add accessories via the cart icon to reach the total: ${list}`);
+      logIssue(`Add accessories manually via the cart icon: ${list}${job.quote?` (total $${round2(job.quote).toFixed(2)})`:''}.`, 'warn');
+    }
+
+    // Paid/Collected status → take payment from the cash (E) + card (F) columns.
+    if (isPaidStatus(job.sosStatus) && payAmount(job) > 0) {
+      await sleep(cfg.stepDelay + 200);
+      let row = job.ticket ? findTicketRow(job.ticket) : null;
+      if (row) {
+        await payOnRow(row, job);
+        row = findTicketRow(job.ticket) || row;
+        if (row && job.sosStatus) await setRowStatus(row, job.sosStatus);
+      } else {
+        logIssue(`Couldn't find the new board row to take the $${payAmount(job).toFixed(2)} payment — take it manually.`, 'warn');
+      }
+    }
+
+    if (cfg.addNotes && job.note) {
+      const row = job.ticket ? findTicketRow(job.ticket) : null;
+      try { if (row) await addNoteOnRow(row, job.note); else await addNote(job.ticket, job.note); }
+      catch (e) { logIssue('Refurb moved to board but note not added: ' + e.message, 'warn'); }
+    }
+  }
+
+  // The "Refurb Item *" combobox — found via its label so it's still locatable after
+  // an item is selected (the button text changes to the item name then).
+  function findRefurbItemButton() {
+    const lab = Array.from(document.querySelectorAll('label')).find(l => /refurb item/i.test(l.textContent));
+    if (lab && lab.parentElement) {
+      const btn = lab.parentElement.querySelector('button[role="combobox"]');
+      if (btn) return btn;
+    }
+    return Array.from(document.querySelectorAll('button[role="combobox"]'))
+      .find(b => /select refurb item|refurb item/i.test(b.textContent)) || null;
+  }
+  function findMoveToBoardButton() {
+    return Array.from(document.querySelectorAll('button')).find(b => /move to board/i.test(b.textContent)) || null;
+  }
+  function visibleRefurbItems() {
+    return Array.from(document.querySelectorAll('[cmdk-item]')).filter(el => el.offsetParent !== null);
+  }
+  // Human-readable label for the confirm modal: the full catalogue value minus the
+  // long IMEI (14–16 digits) so it stays short, e.g. "Apple iPhone SE3 64 Midnight 700".
+  function refurbItemLabel(el) {
+    const dv = el.getAttribute('data-value') || el.textContent || '';
+    return dv.replace(/\b\d{14,16}\b/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  // Open the refurb catalogue search (cmdk palette) from the combobox.
+  async function openRefurbSearch() {
+    const btn = findRefurbItemButton();
+    if (!btn) throw new Error('Refurb Item selector not found');
+    if (!document.querySelector('input[cmdk-input]')) openRadix(btn);
+    let cmdk = await waitFor(() => document.querySelector('input[cmdk-input]'), 2000);
+    if (!cmdk) { btn.click(); cmdk = await waitFor(() => document.querySelector('input[cmdk-input]'), 2000); }
+    return cmdk;
+  }
+
+  // Search the stock #, read the best match, confirm it (or let the user pick
+  // manually / skip). Resolves true once an item is selected in the form.
+  async function selectRefurbItem(job) {
+    const term = String(job.refurbSku || '').trim();
+    if (!term) return await refurbManualFallback(job, 'No stock # on this row.');
+
+    let cmdk = await openRefurbSearch();
+    if (!cmdk) throw new Error('Refurb search did not open');
+    cmdk.focus(); setNativeValue(cmdk, ''); await sleep(80);
+    setNativeValue(cmdk, term); await sleep(650);
+
+    const items = visibleRefurbItems();
+    // Prefer an item whose catalogue value contains the SKU as a whole token.
+    let pick = items.find(el => (el.getAttribute('data-value') || '').split(/\s+/).includes(term)) || items[0] || null;
+    if (!pick) return await refurbManualFallback(job, `No catalogue match for "#${term}".`);
+
+    const dataValue = pick.getAttribute('data-value') || '';
+    const label     = refurbItemLabel(pick);
+
+    // Close the palette before the modal (radix closes on focus-out anyway), then ask.
+    document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
+    await sleep(120);
+
+    const ans = await askRefurbConfirm(label, job.note, term);
+    if (ans === 'yes') return await commitRefurbByValue(term, dataValue);
+    if (ans === 'no')  return await refurbManualFallback(job, `Pick the right item for "#${term}".`);
+    return false;   // skip row
+  }
+
+  // Re-open the search, re-type the SKU, click the item matching the captured value
+  // (the earlier element is stale once the palette closed).
+  async function commitRefurbByValue(term, dataValue) {
+    const cmdk = await openRefurbSearch();
+    if (!cmdk) throw new Error('Refurb search did not re-open');
+    cmdk.focus(); setNativeValue(cmdk, ''); await sleep(80);
+    setNativeValue(cmdk, term); await sleep(650);
+    const items = visibleRefurbItems();
+    const el = items.find(x => (x.getAttribute('data-value') || '') === dataValue) || items[0];
+    if (!el) return false;
+    el.click(); await sleep(cfg.stepDelay);
+    return true;
+  }
+
+  // Let the user pick the refurb manually: open the search, then wait until the
+  // combobox reports a selection (its text stops being the placeholder).
+  async function refurbManualFallback(job, hint) {
+    setStatus(`🔎 ${hint} Pick the refurb item in the panel — I'll wait, then Move to Board.`);
+    try { await openRefurbSearch(); } catch {}
+    const selected = await waitForRefurbSelected(180000);
+    if (selected) { setStatus('✓ Refurb item selected — moving to board…'); return true; }
+    return false;
+  }
+  async function waitForRefurbSelected(timeout = 180000) {
+    return await waitFor(() => {
+      const btn = findRefurbItemButton();
+      if (!btn) return false;
+      const txt = btn.textContent.replace(/\s+/g, ' ').trim().toLowerCase();
+      return txt && !/select refurb item/.test(txt);   // placeholder gone → an item is chosen
+    }, timeout, 400);
+  }
+
+  // Refurb confirm modal — shows the matched device with Use / Pick manually / Skip.
+  // Resolves 'yes' | 'no' | null.
+  function askRefurbConfirm(deviceLabel, note, sku) {
+    return new Promise(resolve => {
+      const ov = document.createElement('div');
+      ov.style.cssText = 'position:fixed;inset:0;z-index:100004;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
+      ov.innerHTML = `
+        <div style="background:#0f172a;border:1px solid #334155;border-radius:14px;padding:18px;width:min(440px,92vw);
+          font-family:'Segoe UI',system-ui,sans-serif;color:#e2e8f0;box-shadow:0 20px 60px rgba(0,0,0,.7)">
+          <div style="font-size:14px;font-weight:700;margin-bottom:3px">Confirm refurb — #${esc(sku || '')}</div>
+          <div style="font-size:11px;color:#64748b;margin-bottom:10px">Is this the right stock item?</div>
+          <div style="background:#08130c;border:1px solid #15803d;border-radius:8px;padding:10px 12px;font-size:13px;
+            font-weight:600;color:#86efac;margin-bottom:10px">${esc(deviceLabel || '(unnamed item)')}</div>
+          <div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Row note</div>
+          <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 10px;font-size:12px;color:#cbd5e1;max-height:110px;overflow-y:auto;white-space:pre-wrap;margin-bottom:12px">${esc(note || '(no note)')}</div>
+          <div style="display:flex;gap:6px">
+            <button id="sostk-rf-ok" style="flex:1;padding:9px;border:none;border-radius:8px;
+              background:#16a34a;color:#fff;font-weight:600;cursor:pointer">Yes — use this</button>
+            <button id="sostk-rf-no" style="padding:9px 12px;border:none;border-radius:8px;
+              background:linear-gradient(135deg,#6366f1,#4f46e5);color:#fff;font-weight:600;cursor:pointer">No — pick manually</button>
+            <button id="sostk-rf-skip" style="padding:9px 12px;border:none;border-radius:8px;
+              background:#334155;color:#94a3b8;font-weight:600;cursor:pointer">Skip</button>
+          </div>
+        </div>`;
+      document.body.appendChild(ov);
+      const onKey = e => { if (e.key === 'Enter') done('yes'); if (e.key === 'Escape') done(null); };
+      const done = v => { document.removeEventListener('keydown', onKey); ov.remove(); resolve(v); };
+      ov.querySelector('#sostk-rf-ok').addEventListener('click', () => done('yes'));
+      ov.querySelector('#sostk-rf-no').addEventListener('click', () => done('no'));
+      ov.querySelector('#sostk-rf-skip').addEventListener('click', () => done(null));
+      document.addEventListener('keydown', onKey);
+    });
   }
 
   // ── Sale payment (Checkout dialog) ────────────────────────────
