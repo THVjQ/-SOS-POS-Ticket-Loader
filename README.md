@@ -1,14 +1,15 @@
 # SOS POS Ticket Loader
 
 A Tampermonkey userscript for **app.sospos.com.au** that turns a pasted block of
-tracking-sheet rows into repair tickets, ticket updates, and product sales — then
-(optionally) writes the new ticket numbers back into your Google Sheet.
+tracking-sheet rows into repair tickets, ticket updates, product sales, and refurb
+moves-to-board — then (optionally) writes the new ticket numbers back into your Google
+Sheet.
 
 It's the repair-side companion to the **SOS POS Sales Loader** and reuses the same
 device/job/name/phone parser. Both run side by side: the Sales Loader sits behind the
 teal 🏷️ button, this one behind the indigo 🔧 button.
 
-Current version: **1.3**
+Current version: **3.0**
 
 ---
 
@@ -23,7 +24,18 @@ happen to it:
 | **Ticket** | Repair status, no existing ticket # | Creates a new repair ticket |
 | **Update** | Repair status **and** a ticket # already in col C | Opens that ticket, sets status, adds note |
 | **Sale** | Product / no device + a price | Stages a walk-in sale line |
+| **Refurb** | A stock **`#123`** appears in the description | Searches that stock number in the refurb catalogue, asks you to confirm the match, then **Move to Board** |
 | **Not completed** | `REFUND`, `NOTE`, or anything unparseable | Skipped and listed for you to handle by hand |
+
+**Refurbs** (rows with a `#stock-number`): the loader opens the Refurb tab, selects/adds the
+customer, searches the number, and pops a confirm modal showing the matched device — **Yes**
+uses it, **No** lets you pick manually, **Skip** drops the row. After it's on the board, any
+add-on items in the line (`+ case $40 = $700`) are flagged so you can add them via the cart
+icon to reach the total.
+
+**Paid / Collected rows** normally read their amount from the quote column (L); when the
+status is a paid/collected one, the loader instead processes the payment from the **cash (E)**
+and **card (F)** columns on the board row.
 
 After each ticket is created it can drop the row's full note text into the ticket's
 **Notes** dialog, and capture the new ticket number into the **Results** tab.
@@ -187,6 +199,12 @@ hardened.
 
 ## Changelog
 
+- **3.0** — **new Refurb route**: rows with a stock `#123` in the description open the
+  Refurb tab, select/add the customer, search that number in the refurb catalogue, show
+  a **confirm modal** (Yes = use it · No = pick manually · Skip), then **Move to Board**.
+  Add-on items in the line (`+ case $40 = $700`) are flagged for the cart; the row's full
+  breakdown still goes into the note. Paid/Collected refurbs take payment from cash (E) +
+  card (F), mirroring the ticket flow.
 - **2.6** — **walk-ins (no customer name, no existing ticket #) always go through the
   Sale tab**, never a repair ticket. Tickets/updates whose status is **Collected / Paid
   & Collected / Paid / Part Paid** now **take the payment** (cash col E + EFTPOS col F,
