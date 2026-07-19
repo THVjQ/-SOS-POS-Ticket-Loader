@@ -9,7 +9,7 @@ It's the repair-side companion to the **SOS POS Sales Loader** and reuses the sa
 device/job/name/phone parser. Both run side by side: the Sales Loader sits behind the
 teal 🏷️ button, this one behind the indigo 🔧 button.
 
-Current version: **3.0**
+Current version: **3.1**
 
 ---
 
@@ -30,8 +30,8 @@ happen to it:
 **Refurbs** (rows with a `#stock-number`): the loader opens the Refurb tab, selects/adds the
 customer, searches the number, and pops a confirm modal showing the matched device — **Yes**
 uses it, **No** lets you pick manually, **Skip** drops the row. After it's on the board, any
-add-on items in the line (`+ case $40 = $700`) are flagged so you can add them via the cart
-icon to reach the total.
+add-on items in the line (`+ case $40 = $700`) are added automatically through the row's cart
+("Add Items to Ticket") so the total matches.
 
 **Paid / Collected rows** normally read their amount from the quote column (L); when the
 status is a paid/collected one, the loader instead processes the payment from the **cash (E)**
@@ -199,6 +199,13 @@ hardened.
 
 ## Changelog
 
+- **3.1** — refurb **accessories are now added automatically**: after Move to Board the
+  loader opens the row's cart ("Add Items to Ticket"), fills each `+ item $x` add-on
+  (name + unit price) and hits Save to Ticket. **Board-row payment fixed**: the checkout
+  is the "Quick Pay (Full Amount)" drawer (Cash / EFTPOS / Transfer), not the sale-tab
+  split dialog — the loader now clicks the right method and recognises an already-paid
+  ticket instead of erroring "Complete Payment button not found". This fixes paid-status
+  payment for **tickets and refurbs** alike.
 - **3.0** — **new Refurb route**: rows with a stock `#123` in the description open the
   Refurb tab, select/add the customer, search that number in the refurb catalogue, show
   a **confirm modal** (Yes = use it · No = pick manually · Skip), then **Move to Board**.

@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), build a product Sale, or move a Refurb to the board (rows with a stock #123). Quote reads from col L; a Paid/Collected status takes payment from the cash (E) + card (F) columns. Refunds & notes are skipped and flagged Not completed. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -24,7 +24,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '3.0';
+  const SCRIPT_VERSION = '3.1';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — device / job / name / phone extraction. v2.9 hardens the
@@ -1409,18 +1409,25 @@
     await sleep(cfg.stepDelay + 400);
     job.ticket = latestTicket() || job.ticket;
 
-    // Accessories to reach the total (e.g. "+ case $40") — the cart isn't wired here,
-    // so flag them for manual entry. The full breakdown is also in the note.
+    // Find the new board row (it renders a beat after Move to Board).
+    let row = await waitFor(() => (job.ticket ? findTicketRow(job.ticket) : null), 4000)
+           || (job.ticket ? findTicketRow(job.ticket) : null);
+
+    // Add accessories ("+ case $40") via the row's cart so the ticket total matches.
     if (job.refurbExtras && job.refurbExtras.length) {
-      const list = job.refurbExtras.map(x => x.label + (x.price ? ` $${x.price}` : '')).join(', ');
-      showSkipBox(`Refurb on board — add accessories via the cart icon to reach the total: ${list}`);
-      logIssue(`Add accessories manually via the cart icon: ${list}${job.quote?` (total $${round2(job.quote).toFixed(2)})`:''}.`, 'warn');
+      if (row) {
+        try { await addAccessoriesOnRow(row, job.refurbExtras); row = findTicketRow(job.ticket) || row; }
+        catch (e) { logIssue('Could not add accessories automatically: ' + e.message, 'warn'); }
+      } else {
+        const list = job.refurbExtras.map(x => x.label + (x.price ? ` $${x.price}` : '')).join(', ');
+        logIssue(`Add accessories manually via the cart icon: ${list}.`, 'warn');
+      }
     }
 
     // Paid/Collected status → take payment from the cash (E) + card (F) columns.
     if (isPaidStatus(job.sosStatus) && payAmount(job) > 0) {
       await sleep(cfg.stepDelay + 200);
-      let row = job.ticket ? findTicketRow(job.ticket) : null;
+      row = (job.ticket ? findTicketRow(job.ticket) : null) || row;
       if (row) {
         await payOnRow(row, job);
         row = findTicketRow(job.ticket) || row;
@@ -1431,10 +1438,45 @@
     }
 
     if (cfg.addNotes && job.note) {
-      const row = job.ticket ? findTicketRow(job.ticket) : null;
+      row = (job.ticket ? findTicketRow(job.ticket) : null) || row;
       try { if (row) await addNoteOnRow(row, job.note); else await addNote(job.ticket, job.note); }
       catch (e) { logIssue('Refurb moved to board but note not added: ' + e.message, 'warn'); }
     }
+  }
+
+  // Add accessory/add-on line items to a board row via its cart ("Add-ons") button:
+  //  row cart icon → "Add Items to Ticket" drawer → fill name + unit price per item
+  //  (Add Another Item for extras) → Save to Ticket. Non-fatal on failure.
+  async function addAccessoriesOnRow(row, extras) {
+    const cartBtn = row.querySelector('button[title="Add-ons"]');
+    if (!cartBtn) { logIssue('Add-ons (cart) button not found on row.', 'warn'); return false; }
+    cartBtn.click();
+    const dlg = await waitFor(() => Array.from(document.querySelectorAll('[role="dialog"]'))
+      .find(d => { const h = d.querySelector('h2'); return h && /add items to ticket/i.test(h.textContent); }), 4000);
+    if (!dlg) { logIssue('Add Items dialog did not open.', 'warn'); return false; }
+    await sleep(cfg.stepDelay);
+
+    for (let k = 0; k < extras.length; k++) {
+      if (k > 0) {
+        const addAnother = Array.from(dlg.querySelectorAll('button')).find(b => /add another item/i.test(b.textContent));
+        if (addAnother) { addAnother.click(); await sleep(220); }
+      }
+      const names = dlg.querySelectorAll('input[placeholder="Item name"]');
+      const nameEl = names[names.length - 1];              // newest (last) cart-item block
+      if (!nameEl) continue;
+      const priceEl = nameEl.parentElement && nameEl.parentElement.querySelector('input[step="0.01"]');
+      setNativeValue(nameEl, extras[k].label || 'Item'); await sleep(90);
+      if (priceEl) { setNativeValue(priceEl, String(extras[k].price || 0)); await sleep(90); }
+    }
+    await sleep(cfg.stepDelay);
+
+    const save = Array.from(dlg.querySelectorAll('button')).find(b => /save to ticket/i.test(b.textContent));
+    if (!save) { logIssue('"Save to Ticket" button not found.', 'warn'); return false; }
+    let t = 0; while (save.disabled && t < 14) { await sleep(140); t++; }
+    if (save.disabled) { logIssue('"Save to Ticket" stayed disabled — add the accessory manually.', 'warn'); return false; }
+    save.click();
+    await sleep(cfg.stepDelay + 300);
+    return true;
   }
 
   // The "Refurb Item *" combobox — found via its label so it's still locatable after
@@ -1628,21 +1670,64 @@
     return Array.from(dialog.querySelectorAll('button')).find(b => /complete payment/i.test(b.textContent));
   }
 
-  // Take payment on a board row: click its Checkout button, then reuse the sale
-  // checkout dialog logic with the row's amounts. Non-fatal — warns on failure.
+  // Take payment on a board row via its Checkout ($) button. The board-row checkout
+  // is a "Quick Pay (Full Amount)" drawer (Cash / EFTPOS / Transfer buttons), NOT the
+  // sale-tab split-input dialog — clicking a method pays the full remaining balance.
+  // Recognises the "already fully paid" state and closes cleanly. Non-fatal on failure.
   async function payOnRow(row, job) {
     const co = row.querySelector('button[title="Checkout"]');
-    if (!co) { logIssue('Checkout button not found on row — take payment manually.', 'warn'); return false; }
+    if (!co) { logIssue('Checkout ($) button not found on row — take payment manually.', 'warn'); return false; }
     co.click();
-    const dialog = await waitFor(() => findSaleCheckoutDialog(), 5000);
+    const dialog = await waitFor(() => rowCheckoutDialog(), 5000);
     if (!dialog) { logIssue('Checkout dialog did not open — take payment manually.', 'warn'); return false; }
     await sleep(cfg.stepDelay);
-    try { await payForSale(job, dialog); return true; }
-    catch (e) {
+    try {
+      // Already settled → nothing to do.
+      if (/already fully paid|no further payment/i.test(dialog.textContent)) { closeDialogEl(dialog); return true; }
+
+      // Pick the method from whichever column carries the money (cash E / card F),
+      // else the configured default. Quick Pay can't split, so a cash+card row is
+      // paid as one method and flagged.
+      const method = (job.cashAmt > 0 && !(job.eftAmt > 0)) ? 'Cash'
+                   : (job.eftAmt > 0 && !(job.cashAmt > 0)) ? 'EFTPOS'
+                   : (cfg.saleMethod === 'cash' ? 'Cash' : cfg.saleMethod === 'transfer' ? 'Transfer' : 'EFTPOS');
+      if (job.cashAmt > 0 && job.eftAmt > 0)
+        logIssue(`Split payment (cash $${round2(job.cashAmt)} + card $${round2(job.eftAmt)}) taken as ${method} via Quick Pay — adjust manually if it must be split.`, 'warn');
+
+      const qp = quickPayButton(dialog, method);
+      if (qp && !qp.disabled) {
+        qp.click();
+        await waitFor(() => !rowCheckoutDialog(), 6000);
+        await sleep(cfg.stepDelay + 200);
+        return true;
+      }
+      logIssue(`Quick Pay "${method}" button unavailable — complete the payment manually.`, 'warn');
+      closeDialogEl(dialog);
+      return false;
+    } catch (e) {
       logIssue('Payment not completed (' + e.message + ') — left for you.', 'warn');
       document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })); await sleep(150);
       return false;
     }
+  }
+
+  // The board-row Checkout drawer (h2 === "Checkout"), distinct from the sale-tab one.
+  function rowCheckoutDialog() {
+    return Array.from(document.querySelectorAll('[role="dialog"]')).find(d => {
+      const h = d.querySelector('h2'); return h && /^checkout$/i.test(h.textContent.trim());
+    }) || null;
+  }
+  // A Quick Pay button whose inner label span reads exactly Cash / EFTPOS / Transfer.
+  function quickPayButton(dialog, label) {
+    return Array.from(dialog.querySelectorAll('button')).find(b => {
+      const sp = b.querySelector('span');
+      return sp && sp.textContent.trim().toLowerCase() === label.toLowerCase();
+    }) || null;
+  }
+  function closeDialogEl(dialog) {
+    const x = dialog.querySelector('button .lucide-x');
+    if (x && x.closest('button')) x.closest('button').click();
+    else document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
   }
 
   // ═════════════════════════════════════════════════════════════
