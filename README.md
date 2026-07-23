@@ -9,7 +9,7 @@ It's the repair-side companion to the **SOS POS Sales Loader** and reuses the sa
 device/job/name/phone parser. Both run side by side: the Sales Loader sits behind the
 teal 🏷️ button, this one behind the indigo 🔧 button.
 
-Current version: **3.1**
+Current version: **3.2**
 
 ---
 
@@ -166,6 +166,7 @@ match what's in the sheet.
 | Apps Script Web App URL | The `/exec` deployment URL |
 | Shared secret | Optional, must match the Apps Script `SECRET` |
 | Column map (JSON) | 0-based column indices |
+| 🔍 Probe columns | Dumps your pasted rows split by tab, every cell indexed and the mapped `CASH`/`EFTPOS`/`QUOTE`/`STATUS` cells marked — console + clipboard. Use it when a paid row tenders the wrong method. |
 | Status map (JSON) | Col D code → route + SOS status |
 | Issue map (JSON) | Parser label → SOS issue checklist name |
 
@@ -180,6 +181,19 @@ These interactions were written to the standard radix/shadcn pattern but the sou
 DOM for the popups wasn't fully captured, so they may need a tweak against the live app:
 
 - **Device search** and **Status dropdown** — best-effort option matching.
+- **Quick Pay method buttons** (v3.2) — matched on the button's full text against
+  `cash` / `eftpos|eft|card|credit card|debit` / `transfer|bank transfer|direct`. If the real
+  labels differ, the drawer HTML is dumped to the console as `[sostk] quick-pay drawer:` —
+  paste that and the match can be hard-wired.
+- **Per-method amount inputs in the board-row Checkout drawer** (v3.2) — assumed to be the
+  same `<label>Cash</label><input type="number">` shape as the sale dialog. If the drawer has
+  no such inputs the loader falls back to single-method Quick Pay and warns; the split path
+  is untested against the live DOM.
+- **Row Checkout ($) and cart buttons** — `title="Checkout"` / `title="Add-ons"` first, then
+  `aria-label`, then a lucide dollar-sign / shopping-cart icon. The icon class names are a guess.
+- **Paid verification** (v3.2) — reads the row's text for *paid / collected / balance $0*.
+  If the board shows paid state only as an icon or colour, this check can't see it, so it
+  stays silent rather than warning.
 - **Update existing ticket** (`openTicketByNumber`) — a stub. Opening an existing ticket
   needs the board search / row-open DOM wired in; until then the Update path can't open
   the ticket on its own.
@@ -199,6 +213,43 @@ hardened.
 
 ## Changelog
 
+- **3.2** — **EFTPOS payments actually go through.** The Quick Pay method button was
+  matched on the *first* `<span>` inside the button with an exact string compare, so any
+  EFTPOS button carrying an icon span, a nested amount, or a label reading *Eftpos / EFT /
+  Card / Credit Card* never matched — the row logged a warning, closed the drawer, and the
+  payment silently never happened. Cash survived because its markup is simpler, which is
+  why *everything looked like it was taken as cash*. Now:
+  - method buttons match on the button's **full normalised text** with per-method synonyms
+    (`cash` · `eftpos|eft|card|credit card|debit` · `transfer|bank transfer|direct`), skipping
+    hidden/`aria-hidden` buttons;
+  - **cash + card rows split properly** when the drawer offers per-method amount inputs;
+    when it doesn't, the full amount still goes on one method but the warning now names
+    both figures explicitly;
+  - if no method button matches, the **drawer's HTML is dumped to the console**
+    (`[sostk] quick-pay drawer:`) and a warning is logged — the row never fails silently;
+  - the Checkout drawer is found by any heading *containing* "checkout" (h1–h4 or the radix
+    title slot) rather than an exact `h2` of "Checkout", the wait respects **Step delay**,
+    and the Checkout ($) click is retried once;
+  - after paying, the row is re-read and a warning is logged if it still shows a balance
+    — a drawer closing is no longer taken as proof of payment;
+  - already-paid detection also accepts *paid in full · balance $0 · nothing owing*.
+- **3.2** — **add-ons now work on repair tickets, not just refurbs.** `+ item $x` parsing
+  was locked inside the refurb branch, so a line like `screen $180 + case $40 = $220` on a
+  repair row parsed no add-ons at all. It now runs for **every** row, and the ticket and
+  update routes add the items through the same **Add Items to Ticket** cart the refurb
+  route uses — **before payment**, since Quick Pay tenders the full outstanding balance and
+  paying first would leave the ticket short by the price of every add-on. The Sale route is
+  unchanged. Because each add-on becomes its own cart line, when column L holds the line's
+  **grand total** the ticket quote is backed down to the base price so the add-ons aren't
+  billed twice; the preview flags this as *ⓘ quote adjusted*.
+- **3.2** — **the money is now visible before you build.** Each preview row shows the parsed
+  **cash**, **EFTPOS**, **quote**, the `= $total`, and every add-on as a chip, so a wrong
+  `CASH`/`EFTPOS` column index is caught before the run instead of after the takings are
+  wrong. New **🔍 Probe columns** button in Settings dumps your pasted rows split by tab with
+  every cell index numbered and the mapped columns marked, to console + clipboard.
+- **3.2** — `num()` hardened: handles `$`, thousands commas, spaces, `AUD`, and both
+  negative forms (`-45` and the accounting `(45.00)`) — it previously **stripped minus
+  signs**, so a refund read as a payment — and returns `0` instead of `NaN` for junk.
 - **3.1** — refurb **accessories are now added automatically**: after Move to Board the
   loader opens the row's cart ("Add Items to Ticket"), fills each `+ item $x` add-on
   (name + unit price) and hits Save to Ticket. **Board-row payment fixed**: the checkout

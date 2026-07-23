@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         SOS POS Ticket Loader
 // @namespace    http://tampermonkey.net/
-// @version      3.1
-// @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), build a product Sale, or move a Refurb to the board (rows with a stock #123). Quote reads from col L; a Paid/Collected status takes payment from the cash (E) + card (F) columns. Refunds & notes are skipped and flagged Not completed. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
+// @version      3.2
+// @description  Paste rows from your tracking sheet. Reads col D status to route each row: create a repair Ticket, update an existing one (ticket # in col C), build a product Sale, or move a Refurb to the board (rows with a stock #123). Quote reads from col L; a Paid/Collected status takes payment from the cash (E) + card (F) columns — EFTPOS now matches properly and a cash+card row splits when the drawer allows it. "+ item $x" add-ons go onto every ticket via the row cart, before payment. Refunds & notes are skipped and flagged Not completed. Optional write-back pushes finished ticket #s into your Google Sheet via an Apps Script web app (bundled as a paste-once block at the bottom of this file). Reuses the Sales Loader's parser. Namespaced sostk-*.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -24,7 +24,7 @@
   // Keep this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '3.1';
+  const SCRIPT_VERSION = '3.2';
 
   // ═════════════════════════════════════════════════════════════
   // Parser — device / job / name / phone extraction. v2.9 hardens the
@@ -528,6 +528,17 @@
     .sostk-line:first-of-type { border-top: none; }
     .sostk-line .ln-desc { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .sostk-line .ln-quote { color: #818cf8; font-weight: 600; }
+    /* Parsed money / add-ons chips (v3.2) — verify the column map before building. */
+    .sostk-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .sostk-chip { font-size: 9.5px; font-weight: 600; padding: 1.5px 5px; border-radius: 5px;
+      border: 1px solid #334155; background: #1e293b; color: #94a3b8; white-space: nowrap; }
+    .sostk-chip.cash  { border-color:#166534; background:#052e16; color:#86efac; }
+    .sostk-chip.eft   { border-color:#1e40af; background:#0c1a3a; color:#93c5fd; }
+    .sostk-chip.quote { border-color:#4338ca; background:#1e1b4b; color:#a5b4fc; }
+    .sostk-chip.extra { border-color:#854d0e; background:#1c1400; color:#fcd34d; }
+    .sostk-chip.total { border-color:#334155; background:#0f172a; color:#cbd5e1; }
+    .sostk-chip.warn  { border-color:#7f1d1d; background:#1f0d0d; color:#fca5a5; cursor:help; }
+    .sostk-chip.none  { color:#475569; }
     .sostk-note-row { font-size: 10px; color: #64748b; font-style: italic; margin-top: 4px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .sostk-q-edit { width:100%; box-sizing:border-box; background:#1e293b; border:1px solid #6366f1;
@@ -697,6 +708,7 @@
       <button class="sostk-btn sostk-btn-primary sostk-btn-sm" id="sostk-save-cfg">Save settings</button>
       <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-reset-cfg" style="margin-left:6px">Reset maps</button>
       <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-probe" style="margin-left:6px">🔍 Probe status</button>
+      <button class="sostk-btn sostk-btn-muted sostk-btn-sm" id="sostk-probe-cols" style="margin-left:6px">🔍 Probe columns</button>
       <hr class="sostk-divider">
       <p class="sostk-note">
         <b>route</b> values: <b>ticket</b> (create repair) · <b>sale</b> (product) · <b>manual</b> (skip → Not completed).<br>
@@ -778,6 +790,31 @@
     fillSettings(); setStatus('Maps reset to defaults — Save to keep.');
   });
 
+  // Diagnostic: dump the pasted rows split by tab, with the index of every cell and
+  // a marker on the ones the column map is currently reading. A merged cell, an
+  // inserted column or a leading blank shifts CASH/EFTPOS and every paid row then
+  // tenders as the wrong method — this makes that visible in one click.
+  document.getElementById('sostk-probe-cols').addEventListener('click', async () => {
+    if (!rawCache.trim()) { setStatus('⚠️ Paste some rows first, then Probe columns.'); return; }
+    const c = COL();
+    const named = Object.keys(c).reduce((m,k) => { (m[c[k]] = m[c[k]] || []).push(k); return m; }, {});
+    const lines = rawCache.split('\n').filter(l => l.trim()).slice(0, 12);
+    const report = lines.map((line, r) => {
+      const cols = line.split('\t');
+      const cells = cols.map((v, i) => {
+        const tag = named[i] ? ` «${named[i].join('/')}»` : '';
+        return `  [${String(i).padStart(2)}]${tag} ${JSON.stringify(v)}`;
+      }).join('\n');
+      return `ROW ${r+1} (${cols.length} cells)\n${cells}\n` +
+             `  → parsed: cash=${num(cols[c.CASH])} eftpos=${num(cols[c.EFTPOS])} ` +
+             `quote=${num(cols[c.QUOTE])} status=${JSON.stringify((cols[c.STATUS]||'').trim())}`;
+    }).join('\n\n');
+    const full = `COLUMN MAP: ${JSON.stringify(c)}\n(0-based: A=0 B=1 C=2 D=3 E=4 F=5 … L=11)\n\n${report}`;
+    console.log('[sostk] column probe:\n' + full);
+    try { await navigator.clipboard.writeText(full); setStatus(`✓ ${lines.length} row(s) dumped to console + clipboard — check the «CASH»/«EFTPOS» cells.`); }
+    catch { setStatus('Columns dumped to the console (F12) — check the «CASH»/«EFTPOS» cells.'); }
+  });
+
   // Diagnostic: open the Status dropdown, read the real option names + the first
   // option's HTML, log them and copy to clipboard. Click this on the Ticket tab.
   document.getElementById('sostk-probe').addEventListener('click', async () => {
@@ -826,8 +863,47 @@
   // ═════════════════════════════════════════════════════════════
   // Parse helpers
   // ═════════════════════════════════════════════════════════════
-  function num(v) { const n = parseFloat(String(v||'').replace(/[^0-9.]/g,'')); return isNaN(n)?0:n; }
+  // Money cell → number. Handles "$1,200.50", "1 200", "AUD 45", "45c"(→45),
+  // "-45" and the accounting negative "(45.00)". Anything unparseable → 0, never
+  // NaN. v3.2: the old version stripped minus signs (a refund read as a payment)
+  // and turned "1.2.3" into NaN.
+  function num(v) {
+    let s = String(v == null ? '' : v).trim();
+    if (!s) return 0;
+    // negative if wrapped in parens, or a '-' leads the numeric part ("$-45", "-$45")
+    const neg = /^\(.*\)$/.test(s) || /^-/.test(s.replace(/^[^0-9.\-(]*/, ''));
+    s = s.replace(/[^0-9.]/g, '');
+    const dot = s.indexOf('.');
+    if (dot >= 0) s = s.slice(0, dot + 1) + s.slice(dot + 1).replace(/\./g, ''); // keep first dot only
+    const n = parseFloat(s);
+    if (isNaN(n)) return 0;
+    return neg ? -n : n;
+  }
   function isExistingTicket(t) { return /^[A-Z]\d{3,}/.test((t||'').trim()); }
+
+  // "+ item $x" add-ons on any row (repair or refurb), e.g.
+  //   "screen $180 + case $40 = $220"  →  [{ label:'case', price:40 }]
+  // Only "+"-joined clauses after the first that carry a $price count; the "#sku"
+  // clause is the refurb device itself, never an add-on. Returns [] for none.
+  function parseExtras(desc) {
+    const out = [];
+    String(desc || '').split('+').slice(1).forEach(seg => {
+      const pm = seg.match(/\$\s*([\d,]+(?:\.\d+)?)/);
+      if (!pm) return;                       // no price → prose, not a line item
+      if (/#\s*\d{3,}/.test(seg)) return;    // the refurb device clause
+      const label = seg.replace(/\$\s*[\d,]+(?:\.\d+)?/,'').replace(/=.*/,'')
+                       .replace(/#\s*\d+/,'').replace(/[-–—:]/g,' ').replace(/\s+/g,' ').trim();
+      out.push({ label: label || 'item', price: num(pm[1]) });
+    });
+    return out;
+  }
+  // The trailing "= $total" on a line, 0 if absent.
+  function parseLineTotal(desc) {
+    const m = String(desc || '').match(/=\s*\$?\s*([\d,]+(?:\.\d+)?)/);
+    return m ? num(m[1]) : 0;
+  }
+  function extrasSum(extras) { return round2((extras || []).reduce((s,x) => s + (x.price||0), 0)); }
+  function extrasLabel(extras) { return (extras || []).map(x => `+ ${x.label}${x.price?` $${x.price}`:''}`).join(', '); }
 
   function extractDescription(cols) {
     const pin = cols.findIndex(c => c.trim().toUpperCase() === 'PIN');
@@ -880,25 +956,16 @@
 
       // Refurb rows carry a stock reference like "#700" (the SKU / stock number).
       // Its presence routes the row to the Refurb tab: we search that number in SOS's
-      // refurb catalogue, confirm the match, then Move to Board. Any "+ item $x" add-ons
-      // (e.g. "+ case $40") and a trailing "= $total" are captured so the accessories
-      // and total can be reconciled on the board.
+      // refurb catalogue, confirm the match, then Move to Board.
       const skuM      = desc.match(/#\s*(\d{3,})/);
       const isRefurb  = !!skuM;
       const refurbSku = isRefurb ? skuM[1] : '';
-      const refurbExtras = [];
-      let   refurbTotal  = 0;
-      if (isRefurb) {
-        const eqM = desc.match(/=\s*\$?\s*([\d,]+(?:\.\d+)?)/);
-        if (eqM) refurbTotal = num(eqM[1]);
-        desc.split('+').slice(1).forEach(seg => {
-          const pm = seg.match(/\$\s*([\d,]+(?:\.\d+)?)/);
-          if (!pm) return;
-          const label = seg.replace(/\$\s*[\d,]+(?:\.\d+)?/,'').replace(/=.*/,'')
-                           .replace(/#\s*\d+/,'').replace(/[-–—]/g,' ').replace(/\s+/g,' ').trim();
-          refurbExtras.push({ label: label || 'item', price: num(pm[1]) });
-        });
-      }
+
+      // v3.2: "+ item $x" add-ons and the trailing "= $total" are parsed for EVERY
+      // row, not just refurbs — a repair line like "screen $180 + case $40 = $220"
+      // gets its case added to the ticket via the cart, same as a refurb does.
+      const extras    = parseExtras(desc);
+      const lineTotal = parseLineTotal(desc);
 
       // Decide route. Status map wins; fall back to content.
       let route = si.route;
@@ -922,7 +989,32 @@
       let quote = 0, needsQuote = false;
       if (route === 'sale')        quote = payNum || qNum;
       else if (route === 'ticket') { quote = qNum; needsQuote = qIsWord; }
-      else if (route === 'refurb') quote = refurbTotal || payNum || qNum;
+      else if (route === 'refurb') quote = lineTotal || payNum || qNum;
+
+      // v3.2 — reconcile the quote against the line's own "= $total" and its add-ons.
+      // Each "+ item $x" is added to the ticket as its OWN cart line, so the figure
+      // typed into the ticket's quote field has to be the BASE price. If the sheet's
+      // quote column holds the line's grand total instead, back the add-ons out of it
+      // — otherwise the case gets billed twice and the ticket overshoots the "= $total".
+      // (Refurbs price the device from the catalogue, and sales are out of scope, so
+      // only the repair-ticket route adjusts.)
+      let totalWarn = '', quoteAdjusted = false;
+      const addSum = extrasSum(extras);
+      if (route === 'ticket' && addSum > 0 && quote > 0 && lineTotal > 0 &&
+          Math.abs(round2(quote) - round2(lineTotal)) <= 0.005 && round2(quote - addSum) > 0) {
+        quote = round2(quote - addSum);
+        quoteAdjusted = true;
+        totalWarn = `Quote column held the line total $${round2(lineTotal).toFixed(2)} — the add-ons ` +
+                    `(${extrasLabel(extras)}) go on as their own cart lines, so the ticket quote was set ` +
+                    `to $${quote.toFixed(2)}. The ticket still totals $${round2(lineTotal).toFixed(2)}.`;
+      }
+      if (!totalWarn && lineTotal > 0 && quote > 0) {
+        const expect = round2(quote + (route === 'ticket' ? addSum : 0));
+        if (Math.abs(expect - round2(lineTotal)) > 0.005)
+          totalWarn = `Quote $${round2(quote).toFixed(2)}` +
+                      (addSum > 0 && route === 'ticket' ? ` + add-ons $${addSum.toFixed(2)}` : '') +
+                      ` ≠ the line's "= $${round2(lineTotal).toFixed(2)}" — check the sheet.`;
+      }
 
       // Existing ticket (col C) + ticket route = update, not create.
       let kind;
@@ -941,7 +1033,10 @@
         jobs:   kind==='refurb' ? [] : ((r.jobs && r.jobs.length) ? r.jobs : []),
         item:   kind==='refurb' ? ('#'+refurbSku+(r.device?' '+r.device:'')) : (r.item || desc),
         quote, needsQuote, cashAmt, eftAmt,
-        refurbSku, refurbExtras,   // stock # to search, and "+ item $x" add-ons to reconcile
+        refurbSku,                 // stock # to search on the Refurb tab
+        extras,                    // "+ item $x" add-ons → cart, on every route
+        refurbExtras: extras,      // legacy alias (same array) — refurb path still reads it
+        lineTotal, totalWarn, quoteAdjusted,   // the line's "= $total" + how the quote reconciles
         note:   desc,             // full original line goes into the Notes dialog
         status: 'pending',
       });
@@ -1015,11 +1110,24 @@
         const quoteEdit = (j.needsQuote && (kind==='ticket'||kind==='update'))
           ? `<input class="sostk-q-edit" data-gi="${gi}" type="number" step="0.01" min="0" placeholder="Cell says “quote” — enter $ here (or leave blank to skip)" value="${j.quote||''}">`
           : '';
+        // v3.2: money + add-ons as parsed, so a wrong CASH/EFTPOS column index or a
+        // mis-parsed add-on is visible BEFORE the run, not after the takings are wrong.
+        const money = kind === 'manual' ? '' : (() => {
+          const bits = [];
+          if (j.cashAmt) bits.push(`<span class="sostk-chip cash">cash $${j.cashAmt.toFixed(2)}</span>`);
+          if (j.eftAmt)  bits.push(`<span class="sostk-chip eft">EFTPOS $${j.eftAmt.toFixed(2)}</span>`);
+          if (!j.cashAmt && !j.eftAmt) bits.push(`<span class="sostk-chip none">no cash/EFTPOS</span>`);
+          bits.push(`<span class="sostk-chip quote">quote $${(j.quote||0).toFixed(2)}</span>`);
+          (j.extras||[]).forEach(x => bits.push(`<span class="sostk-chip extra">+ ${esc(x.label)} $${(x.price||0).toFixed(2)}</span>`));
+          if (j.lineTotal) bits.push(`<span class="sostk-chip total">= $${j.lineTotal.toFixed(2)}</span>`);
+          if (j.totalWarn) bits.push(`<span class="sostk-chip ${j.quoteAdjusted?'extra':'warn'}" title="${esc(j.totalWarn)}">${j.quoteAdjusted?'ⓘ quote adjusted':'⚠ total mismatch'}</span>`);
+          return `<div class="sostk-chips">${bits.join('')}</div>`;
+        })();
         const noteRow = cfg.addNotes && j.note ? `<div class="sostk-note-row" title="${esc(j.note)}">📝 ${esc(j.note.slice(0,90))}${j.note.length>90?'…':''}</div>` : '';
         html.push(`
           <div class="sostk-job ${j.status==='done'?'done':(kind==='update'?'update':kind==='manual'?'manual':kind==='refurb'?'refurb':'')}" id="sostk-job-${gi}">
             <div class="sostk-job-head">${badge}<span class="sostk-job-name">${title}</span>${statusTag}</div>
-            ${sub}${dev}${quoteEdit}${noteRow}
+            ${sub}${dev}${money}${quoteEdit}${noteRow}
           </div>`);
       }
     }
@@ -1139,6 +1247,9 @@
   // ═════════════════════════════════════════════════════════════
   async function buildJob(job) {
     currentLabel = labelOf(job);
+    // Parse-time quote/total mismatch is logged here (doParse clears the log after
+    // a paste, so it can't be raised there).
+    if (job.totalWarn) logIssue(job.totalWarn, 'warn');
     if (job.kind === 'ticket')      await buildTicket(job);
     else if (job.kind === 'update') await updateTicket(job);
     else if (job.kind === 'sale')   await buildSale(job);
@@ -1234,11 +1345,20 @@
     await sleep(cfg.stepDelay + 400);
     job.ticket = latestTicket() || job.ticket;
 
+    // Find the new board row (it renders a beat after Create Ticket), same as the
+    // refurb route does.
+    let row = await waitFor(() => (job.ticket ? findTicketRow(job.ticket) : null), 4000)
+           || (job.ticket ? findTicketRow(job.ticket) : null);
+
+    // v3.2: add-ons ("+ case $40") go on the ticket via the row cart — BEFORE the
+    // payment below, or Quick Pay would tender a balance that's short by their value.
+    row = await addExtrasForJob(job, row);
+
     // Repaired & collected/paid → take the payment for the respective amount on the
     // ticket's new board row, then re-assert the status so it sticks.
     if (isPaidStatus(job.sosStatus) && payAmount(job) > 0) {
       await sleep(cfg.stepDelay + 200);
-      let row = job.ticket ? findTicketRow(job.ticket) : null;
+      row = (job.ticket ? findTicketRow(job.ticket) : null) || row;
       if (row) {
         await payOnRow(row, job);
         row = findTicketRow(job.ticket) || row;
@@ -1249,7 +1369,7 @@
     }
 
     if (cfg.addNotes && job.note) {
-      const row = job.ticket ? findTicketRow(job.ticket) : null;
+      row = (job.ticket ? findTicketRow(job.ticket) : null) || row;
       try { if (row) await addNoteOnRow(row, job.note); else await addNote(job.ticket, job.note); }
       catch (e) { logIssue('Ticket created but note not added: ' + e.message, 'warn'); setStatus('⚠️ Ticket made, note skipped: ' + e.message); }
     }
@@ -1318,6 +1438,10 @@
       throw skipError(`Ticket ${job.ticket} not on board — auto-skipped.`);
     }
     row.scrollIntoView({ block:'center' }); await sleep(150);
+
+    // v3.2: add-ons first — same ordering rule as the ticket/refurb routes, since
+    // the payment below tenders the full outstanding balance.
+    row = await addExtrasForJob(job, row);
 
     // Collected/paid → take payment first (it may change status), then assert status.
     if (isPaidStatus(job.sosStatus) && payAmount(job) > 0) {
@@ -1413,16 +1537,8 @@
     let row = await waitFor(() => (job.ticket ? findTicketRow(job.ticket) : null), 4000)
            || (job.ticket ? findTicketRow(job.ticket) : null);
 
-    // Add accessories ("+ case $40") via the row's cart so the ticket total matches.
-    if (job.refurbExtras && job.refurbExtras.length) {
-      if (row) {
-        try { await addAccessoriesOnRow(row, job.refurbExtras); row = findTicketRow(job.ticket) || row; }
-        catch (e) { logIssue('Could not add accessories automatically: ' + e.message, 'warn'); }
-      } else {
-        const list = job.refurbExtras.map(x => x.label + (x.price ? ` $${x.price}` : '')).join(', ');
-        logIssue(`Add accessories manually via the cart icon: ${list}.`, 'warn');
-      }
-    }
+    // Accessories ("+ case $40") go on via the row's cart — before payment.
+    row = await addExtrasForJob(job, row);
 
     // Paid/Collected status → take payment from the cash (E) + card (F) columns.
     if (isPaidStatus(job.sosStatus) && payAmount(job) > 0) {
@@ -1447,12 +1563,13 @@
   // Add accessory/add-on line items to a board row via its cart ("Add-ons") button:
   //  row cart icon → "Add Items to Ticket" drawer → fill name + unit price per item
   //  (Add Another Item for extras) → Save to Ticket. Non-fatal on failure.
+  //  v3.2: used by the ticket + update routes too, so the button and the drawer
+  //  heading are both matched defensively rather than on one exact attribute.
   async function addAccessoriesOnRow(row, extras) {
-    const cartBtn = row.querySelector('button[title="Add-ons"]');
+    const cartBtn = findRowCartButton(row);
     if (!cartBtn) { logIssue('Add-ons (cart) button not found on row.', 'warn'); return false; }
     cartBtn.click();
-    const dlg = await waitFor(() => Array.from(document.querySelectorAll('[role="dialog"]'))
-      .find(d => { const h = d.querySelector('h2'); return h && /add items to ticket/i.test(h.textContent); }), 4000);
+    const dlg = await waitFor(() => addItemsDialog(), Math.max(4000, cfg.stepDelay * 6));
     if (!dlg) { logIssue('Add Items dialog did not open.', 'warn'); return false; }
     await sleep(cfg.stepDelay);
 
@@ -1477,6 +1594,41 @@
     save.click();
     await sleep(cfg.stepDelay + 300);
     return true;
+  }
+
+  // The row's cart control. title="Add-ons" is the happy path; fall back to an
+  // aria-label and then to a shopping-cart icon.
+  function findRowCartButton(row) {
+    return row.querySelector('button[title="Add-ons" i]') ||
+           row.querySelector('button[aria-label*="add-on" i], button[aria-label*="add on" i], button[aria-label*="add item" i]') ||
+           Array.from(row.querySelectorAll('button')).find(b =>
+             /add[\s-]?ons?|add items?/i.test(b.getAttribute('title') || '') ||
+             b.querySelector('svg.lucide-shopping-cart, svg.lucide-shopping-bag, svg.lucide-shopping-basket')) || null;
+  }
+
+  // The "Add Items to Ticket" drawer, matched loosely on any heading.
+  function addItemsDialog() {
+    return Array.from(document.querySelectorAll('[role="dialog"]')).find(d => {
+      const h = d.querySelector('h1,h2,h3,h4,[data-slot="dialog-title"]');
+      return (h && /add items?( to ticket)?/i.test(h.textContent)) ||
+             !!d.querySelector('input[placeholder="Item name"]');
+    }) || null;
+  }
+
+  // Shared add-on step for the ticket / update / refurb routes.
+  // ORDER MATTERS: this must run BEFORE payOnRow. Quick Pay tenders the full
+  // outstanding balance, so taking payment first and then adding a $40 case leaves
+  // the ticket $40 short. Returns the (re-found) row. Never throws.
+  async function addExtrasForJob(job, row) {
+    const extras = job.extras || job.refurbExtras;
+    if (!extras || !extras.length) return row;
+    if (!row) {
+      logIssue(`Couldn't find the board row to add ${extrasLabel(extras)} — add them manually via the cart icon.`, 'warn');
+      return row;
+    }
+    try { await addAccessoriesOnRow(row, extras); }
+    catch (e) { logIssue(`Could not add ${extrasLabel(extras)} automatically (${e.message}) — add them manually via the cart icon.`, 'warn'); }
+    return (job.ticket ? findTicketRow(job.ticket) : null) || row;
   }
 
   // The "Refurb Item *" combobox — found via its label so it's still locatable after
@@ -1661,49 +1813,54 @@
     });
   }
   // The split inputs sit in <div><label>Cash|EFTPOS|Transfer</label><input type=number></div>.
+  // Exact label match first (unchanged for the sale dialog); v3.2 adds a loose
+  // synonym pass so the board-row Checkout drawer can be split too when it offers
+  // amount fields, and looks one level further up if the input isn't a sibling.
   function splitInput(dialog, labelText) {
-    const lab = Array.from(dialog.querySelectorAll('label')).find(l => l.textContent.trim() === labelText);
+    const labs = Array.from(dialog.querySelectorAll('label'));
+    let lab = labs.find(l => l.textContent.trim() === labelText);
+    if (!lab) {
+      const rx = QUICK_PAY_RX[String(labelText || '').toLowerCase()];
+      if (rx) lab = labs.find(l => rx.test(norm(l.textContent)));
+    }
     if (!lab) return null;
-    return (lab.parentElement || dialog).querySelector('input[type="number"]');
+    const near = lab.parentElement || dialog;
+    return near.querySelector('input[type="number"]') ||
+           (near.parentElement || dialog).querySelector('input[type="number"]');
   }
   function findCompletePaymentBtn(dialog) {
     return Array.from(dialog.querySelectorAll('button')).find(b => /complete payment/i.test(b.textContent));
   }
 
   // Take payment on a board row via its Checkout ($) button. The board-row checkout
-  // is a "Quick Pay (Full Amount)" drawer (Cash / EFTPOS / Transfer buttons), NOT the
-  // sale-tab split-input dialog — clicking a method pays the full remaining balance.
-  // Recognises the "already fully paid" state and closes cleanly. Non-fatal on failure.
+  // is normally a "Quick Pay (Full Amount)" drawer (Cash / EFTPOS / Transfer buttons)
+  // which tenders the whole remaining balance under one method. v3.2: if the drawer
+  // does expose per-method amount inputs we split properly instead; every selector
+  // is text-based and defensive, and an unmatched method dumps the drawer HTML to
+  // the console rather than silently skipping the payment. Non-fatal throughout.
   async function payOnRow(row, job) {
-    const co = row.querySelector('button[title="Checkout"]');
+    const co = findRowCheckoutButton(row);
     if (!co) { logIssue('Checkout ($) button not found on row — take payment manually.', 'warn'); return false; }
     co.click();
-    const dialog = await waitFor(() => rowCheckoutDialog(), 5000);
+    // The drawer can lag on a slow board; respect the configured step delay and
+    // retry the click once before giving up.
+    let dialog = await waitFor(() => rowCheckoutDialog(), Math.max(6000, cfg.stepDelay * 8));
+    if (!dialog) {
+      co.click();
+      dialog = await waitFor(() => rowCheckoutDialog(), Math.max(4000, cfg.stepDelay * 5));
+    }
     if (!dialog) { logIssue('Checkout dialog did not open — take payment manually.', 'warn'); return false; }
     await sleep(cfg.stepDelay);
     try {
       // Already settled → nothing to do.
-      if (/already fully paid|no further payment/i.test(dialog.textContent)) { closeDialogEl(dialog); return true; }
+      if (ALREADY_PAID_RX.test(norm(dialog.textContent))) { closeDialogEl(dialog); return true; }
 
-      // Pick the method from whichever column carries the money (cash E / card F),
-      // else the configured default. Quick Pay can't split, so a cash+card row is
-      // paid as one method and flagged.
-      const method = (job.cashAmt > 0 && !(job.eftAmt > 0)) ? 'Cash'
-                   : (job.eftAmt > 0 && !(job.cashAmt > 0)) ? 'EFTPOS'
-                   : (cfg.saleMethod === 'cash' ? 'Cash' : cfg.saleMethod === 'transfer' ? 'Transfer' : 'EFTPOS');
-      if (job.cashAmt > 0 && job.eftAmt > 0)
-        logIssue(`Split payment (cash $${round2(job.cashAmt)} + card $${round2(job.eftAmt)}) taken as ${method} via Quick Pay — adjust manually if it must be split.`, 'warn');
-
-      const qp = quickPayButton(dialog, method);
-      if (qp && !qp.disabled) {
-        qp.click();
-        await waitFor(() => !rowCheckoutDialog(), 6000);
-        await sleep(cfg.stepDelay + 200);
-        return true;
-      }
-      logIssue(`Quick Pay "${method}" button unavailable — complete the payment manually.`, 'warn');
-      closeDialogEl(dialog);
-      return false;
+      const cash = round2(job.cashAmt || 0), eft = round2(job.eftAmt || 0);
+      const ok = (cash > 0 && eft > 0)
+        ? await paySplitOnRow(dialog, job, cash, eft)
+        : await payQuickOnRow(dialog, job, cash, eft);
+      if (ok) await verifyRowPaid(job);
+      return ok;
     } catch (e) {
       logIssue('Payment not completed (' + e.message + ') — left for you.', 'warn');
       document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', bubbles:true })); await sleep(150);
@@ -1711,18 +1868,136 @@
     }
   }
 
-  // The board-row Checkout drawer (h2 === "Checkout"), distinct from the sale-tab one.
+  // One method, full balance — the normal Quick Pay path.
+  async function payQuickOnRow(dialog, job, cash, eft) {
+    const method = (cash > 0 && eft <= 0) ? 'Cash'
+                 : (eft > 0 && cash <= 0) ? 'EFTPOS'
+                 : (cfg.saleMethod === 'cash' ? 'Cash' : cfg.saleMethod === 'transfer' ? 'Transfer' : 'EFTPOS');
+    const qp = quickPayButton(dialog, method);
+    if (qp && !qp.disabled) {
+      qp.click();
+      await waitFor(() => !rowCheckoutDialog(), 6000);
+      await sleep(cfg.stepDelay + 200);
+      return true;
+    }
+    dumpDrawer(dialog, `no Quick Pay button matched "${method}"`);
+    logIssue(`Quick Pay "${method}" button not found in the Checkout drawer — pay the $${payAmount(job).toFixed(2)} manually. ` +
+             `The drawer's HTML was dumped to the console (F12) so the button can be pinned down.`, 'warn');
+    closeDialogEl(dialog);
+    return false;
+  }
+
+  // Cash + card on the same row. Quick Pay can't split, so try the drawer's own
+  // per-method amount inputs first (same shape as the sale dialog); only fall back
+  // to a single-method Quick Pay — and say so explicitly — if they aren't there.
+  async function paySplitOnRow(dialog, job, cash, eft) {
+    const cashIn = splitInput(dialog, 'Cash'), eftIn = splitInput(dialog, 'EFTPOS');
+    if (!cashIn || !eftIn) {
+      const method = cfg.saleMethod === 'cash' ? 'Cash' : cfg.saleMethod === 'transfer' ? 'Transfer' : 'EFTPOS';
+      logIssue(`Row is cash $${cash.toFixed(2)} + EFTPOS $${eft.toFixed(2)}, but the Checkout drawer has no ` +
+               `per-method amount fields — the full $${round2(cash+eft).toFixed(2)} was tendered as ${method} ` +
+               `via Quick Pay. Re-split it manually so the day's takings are right.`, 'warn');
+      return payQuickOnRow(dialog, job, 0, 0);   // 0/0 → falls through to the default method
+    }
+    const trIn = splitInput(dialog, 'Transfer');
+    [cashIn, eftIn, trIn].forEach(i => { if (i) setNativeValue(i, ''); });
+    await sleep(120);
+    setNativeValue(cashIn, cash.toFixed(2)); await sleep(140);
+    setNativeValue(eftIn,  eft.toFixed(2));  await sleep(140);
+    await sleep(cfg.stepDelay);
+
+    const complete = findCompletePaymentBtn(dialog) ||
+                     Array.from(dialog.querySelectorAll('button')).find(b => /^(confirm|pay|take payment)\b/i.test(norm(b.textContent)));
+    if (!complete) {
+      dumpDrawer(dialog, 'split inputs found but no confirm button');
+      logIssue(`Split cash $${cash.toFixed(2)} + EFTPOS $${eft.toFixed(2)} entered but no confirm button was found — ` +
+               `finish it in the drawer. Drawer HTML dumped to the console.`, 'warn');
+      return false;
+    }
+    let t = 0; while (complete.disabled && t < 14) { await sleep(140); t++; }
+    if (complete.disabled) {
+      logIssue(`Split payment left open — the confirm button stayed disabled (amounts may not total the balance).`, 'warn');
+      return false;
+    }
+    complete.click();
+    await waitFor(() => !rowCheckoutDialog(), 6000);
+    await sleep(cfg.stepDelay + 200);
+    return true;
+  }
+
+  // Re-find the row after paying and check it actually reads as settled. A drawer
+  // that closes is not proof the tender went through.
+  async function verifyRowPaid(job) {
+    if (!job.ticket) return;
+    await sleep(cfg.stepDelay);
+    const row = findTicketRow(job.ticket);
+    if (!row) return;                       // row may have moved column/board — don't cry wolf
+    const txt = norm(row.textContent);
+    if (/\bpaid\b|\bcollected\b/.test(txt) || ALREADY_PAID_RX.test(txt)) return;
+    if (/balance|owing|due|unpaid/.test(txt))
+      logIssue(`Payment on ${job.ticket} may not have gone through — the row still shows a balance. Check it.`, 'warn');
+  }
+
+  // The row's Checkout ($) control. title="Checkout" is the happy path; fall back to
+  // an aria-label and then to a dollar-sign icon button, since the title attribute
+  // isn't guaranteed.
+  function findRowCheckoutButton(row) {
+    return row.querySelector('button[title="Checkout" i]') ||
+           row.querySelector('button[aria-label*="checkout" i]') ||
+           Array.from(row.querySelectorAll('button')).find(b =>
+             /checkout/i.test(b.getAttribute('title') || '') ||
+             b.querySelector('svg.lucide-dollar-sign, svg.lucide-circle-dollar-sign, svg.lucide-banknote') ||
+             /^\$$/.test(norm(b.textContent))) || null;
+  }
+
+  // The board-row Checkout drawer. v3.2: matches any dialog whose heading merely
+  // CONTAINS "checkout" (h1–h4 or the radix dialog-title slot) — the old exact
+  // /^checkout$/ on an h2 missed "Checkout — T1234" and friends. The sale-tab
+  // dialog is excluded by identity so the two never cross.
   function rowCheckoutDialog() {
+    const saleDlg = findSaleCheckoutDialog();
     return Array.from(document.querySelectorAll('[role="dialog"]')).find(d => {
-      const h = d.querySelector('h2'); return h && /^checkout$/i.test(h.textContent.trim());
+      if (d.offsetParent === null && d.getAttribute('aria-hidden') === 'true') return false;
+      const h = d.querySelector('h1,h2,h3,h4,[data-slot="dialog-title"],[id$="dialog-title"]');
+      if (!h || !/checkout/i.test(h.textContent)) return false;
+      return !(saleDlg && d === saleDlg);
     }) || null;
   }
-  // A Quick Pay button whose inner label span reads exactly Cash / EFTPOS / Transfer.
+
+  // Quick Pay method button. Matches the button's FULL normalised text (the old
+  // version read only its first <span> and demanded exact equality, which is why an
+  // EFTPOS button rendering an icon span — or reading "Card"/"Eftpos" — never matched
+  // and every row silently fell through to Cash). Hidden buttons are ignored.
+  const QUICK_PAY_RX = {
+    cash:     /\bcash\b/,
+    eftpos:   /\b(eftpos|eft|card|credit\s*card|debit)\b/,
+    transfer: /\b(transfer|bank\s*transfer|direct)\b/,
+  };
   function quickPayButton(dialog, label) {
-    return Array.from(dialog.querySelectorAll('button')).find(b => {
-      const sp = b.querySelector('span');
-      return sp && sp.textContent.trim().toLowerCase() === label.toLowerCase();
-    }) || null;
+    const rx = QUICK_PAY_RX[String(label || '').toLowerCase()];
+    if (!rx) return null;
+    const cands = Array.from(dialog.querySelectorAll('button')).filter(b => {
+      if (b.getAttribute('aria-hidden') === 'true' || b.offsetParent === null) return false;
+      const st = b.ownerDocument.defaultView.getComputedStyle(b);
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+      return rx.test(norm(b.textContent));
+    });
+    // Prefer the tightest label (a bare "EFTPOS" over a "Pay EFTPOS $120.00" wrapper
+    // is the same button in practice, but the shorter text is the likelier real one).
+    cands.sort((a,b) => norm(a.textContent).length - norm(b.textContent).length);
+    return cands[0] || null;
+  }
+  // Whitespace-collapsed, lower-cased text — every drawer match runs through this.
+  function norm(s) { return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
+  // "Nothing left to pay" in all the wordings the drawer uses.
+  // The [^$\d]{0,20} gap absorbs "Balance:", "Balance due —", "Balance remaining"
+  // etc. It can't cross a '$' or a digit, so a real "Balance owing: $120.00" is
+  // still (correctly) not a match.
+  const ALREADY_PAID_RX = /already fully paid|no further payment|paid in full|fully paid|balance[^$\d]{0,20}\$?\s*0(\.00)?\b|nothing owing|no balance|no amount (due|owing)/;
+  // Dump a drawer's markup so an unmatched control can be pinned down from the console.
+  function dumpDrawer(dialog, why) {
+    try { console.log(`[sostk] quick-pay drawer: ${why}\n` + (dialog ? dialog.outerHTML : '(no dialog)')); }
+    catch {}
   }
   function closeDialogEl(dialog) {
     const x = dialog.querySelector('button .lucide-x');
